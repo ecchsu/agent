@@ -64,6 +64,16 @@
             <version>5.0.0</version>
             <scope>provided</scope>
         </dependency>
+        <!-- Compile scope (not provided): unlike Spring, the target app doesn't bring its own
+             ASM the agent can rely on, so this must be bundled into the agent jar itself (shaded
+             + relocated in arex-agent/pom.xml to avoid colliding with a target app's own copy,
+             e.g. via CGLIB/Hibernate). Used only for the narrow, straight-line-only bytecode scan
+             in OneHopFieldCopyScanner - no asm-tree/asm-analysis needed. -->
+        <dependency>
+            <groupId>org.ow2.asm</groupId>
+            <artifactId>asm</artifactId>
+            <version>9.6</version>
+        </dependency>
     </dependencies>
 
 </project>

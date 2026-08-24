@@ -22,8 +22,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * @ConfigurationProperties class - plus, separately, any field anywhere in the bean graph whose
  * declared type is a record-based @ConfigurationProperties class already found this way (see
  * {@link #mergeRecordHolderFields}: a record can't be mutated in place during replay, so its
- * holder field gets swapped instead - see RecordConfigSource). Read (never modified) afterward,
- * once per request, by SpringBeanConfigExtractor.
+ * holder field gets swapped instead - see RecordConfigSource) - plus, separately, any field
+ * elsewhere that a known source field's value was copied unchanged into via exactly one
+ * constructor hop (see OneHopFieldCopyScanner). Read (never modified) afterward, once per
+ * request, by SpringBeanConfigExtractor.
  */
 public class SpringBeanConfigRegistry {
 
@@ -102,6 +104,26 @@ public class SpringBeanConfigRegistry {
                 BEAN_FIELDS.put(beanName, fields);
             }
         }
+
+        // One-hop constructor-flattening: a value read from a known source field and passed
+        // unchanged into another bean's constructor, cached in that bean's own field (e.g.
+        // fetchGroup -> GetFabImpl.fetchGroup). Runs last, since it needs BEAN_FIELDS/
+        // RECORD_HOLDER_FIELDS above already populated as its set of known sources.
+        Map<String, List<Field>> derivedFields = OneHopFieldCopyScanner.findOneHopCopies(
+                applicationBeans, BEAN_FIELDS, RECORD_HOLDER_FIELDS);
+        for (Map.Entry<String, List<Field>> derivedEntry : derivedFields.entrySet()) {
+            String beanName = derivedEntry.getKey();
+            List<Field> existing = BEAN_FIELDS.get(beanName);
+            if (existing == null) {
+                BEAN_INSTANCES.put(beanName, applicationBeans.get(beanName));
+                BEAN_FIELDS.put(beanName, new ArrayList<>(derivedEntry.getValue()));
+            } else {
+                List<Field> merged = new ArrayList<>(existing);
+                merged.addAll(derivedEntry.getValue());
+                BEAN_FIELDS.put(beanName, merged);
+            }
+        }
+
         LogManager.info("spring.bean.config.registry",
                 "registered " + BEAN_INSTANCES.size() + " bean(s) with @Value/@ConfigurationProperties "
                         + "fields, covering " + BEAN_FIELDS.values().stream().mapToInt(List::size).sum()
