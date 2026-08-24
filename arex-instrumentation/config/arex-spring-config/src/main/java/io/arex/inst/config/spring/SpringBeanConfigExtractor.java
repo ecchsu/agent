@@ -90,12 +90,21 @@ public class SpringBeanConfigExtractor {
                     if (raw == null) {
                         continue; // fail-open: no recording for this field, leave it untouched
                     }
-                    Object replayedValue = Serializer.deserializeWithType(raw);
-                    if (originalValues == null) {
-                        originalValues = new LinkedHashMap<>();
+                    // Isolated per field: a bad write for one field (e.g. a type mismatch from
+                    // deserialization, or a record's final field rejecting reflective mutation
+                    // entirely) must not abort replay for every other field/bean in this request.
+                    try {
+                        Object replayedValue = Serializer.deserializeWithType(raw);
+                        Object original = getFieldValue(field, bean);
+                        setFieldValue(field, bean, replayedValue);
+                        if (originalValues == null) {
+                            originalValues = new LinkedHashMap<>();
+                        }
+                        originalValues.put(field, original);
+                    } catch (Throwable t) {
+                        LogManager.warn("spring.bean.config.field.replay.error",
+                                new IllegalStateException("failed to replay " + beanName + "." + field.getName(), t));
                     }
-                    originalValues.put(field, getFieldValue(field, bean));
-                    setFieldValue(field, bean, replayedValue);
                 }
                 if (originalValues != null) {
                     originalValuesByBean.put(beanName, originalValues);
