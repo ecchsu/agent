@@ -11,6 +11,16 @@
     <modelVersion>4.0.0</modelVersion>
 
     <artifactId>arex-spring-config</artifactId>
+
+    <properties>
+        <!-- Test fixtures use `record` syntax (Java 16+) to exercise record-based
+             @ConfigurationProperties support. Main code stays on the inherited java.version (8)
+             for broad target-JVM compatibility - only test compilation, which never ships in the
+             agent jar or runs inside a target app, needs a newer source/target level. -->
+        <maven.compiler.testSource>17</maven.compiler.testSource>
+        <maven.compiler.testTarget>17</maven.compiler.testTarget>
+    </properties>
+
     <dependencies>
         <dependency>
             <groupId>org.springframework</groupId>

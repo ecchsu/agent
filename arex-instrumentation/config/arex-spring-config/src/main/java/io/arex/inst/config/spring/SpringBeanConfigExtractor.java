@@ -94,7 +94,19 @@ public class SpringBeanConfigExtractor {
                     // deserialization, or a record's final field rejecting reflective mutation
                     // entirely) must not abort replay for every other field/bean in this request.
                     try {
-                        Object replayedValue = Serializer.deserializeWithType(raw);
+                        Class<?> recordType = SpringBeanConfigRegistry.recordHolderFields().get(field);
+                        Object replayedValue;
+                        if (recordType != null) {
+                            // field holds a reference to a record source, which can't be mutated
+                            // in place - rebuild it and swap the reference instead (see
+                            // RecordConfigSource).
+                            @SuppressWarnings("unchecked")
+                            Map<String, String> componentOverrides = Serializer.deserialize(raw, Map.class);
+                            Object currentRecordInstance = getFieldValue(field, bean);
+                            replayedValue = RecordConfigSource.reconstruct(recordType, currentRecordInstance, componentOverrides);
+                        } else {
+                            replayedValue = Serializer.deserializeWithType(raw);
+                        }
                         Object original = getFieldValue(field, bean);
                         setFieldValue(field, bean, replayedValue);
                         if (originalValues == null) {
@@ -181,7 +193,14 @@ public class SpringBeanConfigExtractor {
                 if (value == null) {
                     continue;
                 }
-                allValues.put(fieldKey(beanName, field), Serializer.serializeWithType(value));
+                boolean isRecordHolder = SpringBeanConfigRegistry.recordHolderFields().containsKey(field);
+                String serialized = isRecordHolder
+                        ? RecordConfigSource.serializeComponents(value)
+                        : Serializer.serializeWithType(value);
+                if (serialized == null) {
+                    continue;
+                }
+                allValues.put(fieldKey(beanName, field), serialized);
             }
         }
         if (allValues.isEmpty()) {
