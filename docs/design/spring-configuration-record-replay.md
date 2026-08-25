@@ -1035,6 +1035,42 @@ differs from earlier sections of this proposal, and why.
 - **Part A and Part B together**: added a combined endpoint touching both mechanisms in one
   request; confirmed both replay correctly within the same case, not just in isolation.
 
+### 12.4 Further hardening after real-app testing (Phase 0-3)
+
+Testing against a real target application (not just the demo) surfaced four further gaps in Part
+B, all fixed since the sections above were written. Full file-by-file detail, tests, and live
+verification for each is in `SPRING_CONFIG_CHANGES.md`; summarized here so this proposal's account
+of "what's actually running" stays current:
+
+- **Phase 0** — a type mismatch on one field (`IllegalArgumentException`) wasn't caught by the
+  per-field isolation §12.2 already relies on (only `IllegalAccessException` was), aborting
+  override for the whole request instead of just that field. Now isolated per-field.
+- **Phase 1** — §7.5's note that constructor-bound `@ConfigurationProperties` "need the whole
+  object replacement path" was correct but unimplemented for the case where that object is a
+  **Java record**: `Field.set()` throws `IllegalAccessException` on a record component even with
+  `setAccessible(true)`, unlike an ordinary final field. Fixed by reconstructing a new record
+  instance via its canonical constructor and swapping the reference in whatever field holds it.
+- **Phase 2** — a `@Value` field read once and passed unchanged into another bean's constructor
+  (the same shape §7.5's first bullet describes for a `@Bean` factory-method parameter, but for
+  any constructor, not only factory methods) is invisible to field-based discovery: the source
+  field overwrites fine, but nothing re-reads it once copied. Fixed with a narrow, straight-line
+  bytecode scanner (`OneHopFieldCopyScanner`) that finds exactly this one-hop passthrough shape and
+  registers the derived field too.
+- **Phase 3** — two further gaps found only via real-app testing, neither exercised by the original
+  demo app: (a) the same one-hop scanner silently failed for any AOP-advised target bean
+  (`@Transactional`/`@Cacheable`/`@Async`/custom `@Aspect`) or any `@Configuration`-enhanced class —
+  both are CGLIB-generated at runtime with no loadable `.class` resource, and a CGLIB proxy
+  additionally doesn't share field storage with the object it wraps, so correct class resolution
+  alone wasn't sufficient; (b) a record accessor method call (`someRecord.someField()`) on a record
+  injected directly as a `@Bean` parameter wasn't a recognized source shape at all — extended the
+  scanner to recognize it.
+
+Each was found and fixed via live reproduction against `arex-spring-config-demo` (extended with
+matching fixtures for Phase 3's two gaps), then confirmed via the real `arex-schedule` webhook,
+including under genuine concurrent, multi-environment replay (20 distinct environments, 80 cases,
+fired concurrently against one shared replay target, zero cross-contamination) — same verification
+discipline as §12.3.
+
 ## 13. Debugging: tracing a request through the logs
 
 Every log line below only fires on genuine record- or replay-mode traffic — a request with no

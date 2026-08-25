@@ -7,12 +7,15 @@ import org.objectweb.asm.Label;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
+import org.springframework.util.ClassUtils;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
+import java.lang.reflect.RecordComponent;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -20,19 +23,36 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Discovers the "straight-line, one-hop" constructor-flattening pattern: a source field is read
- * unchanged ({@code this.field}) inside its own declaring class's bytecode, passed unchanged as
- * one argument to {@code new SomeOtherClass(...)}, and assigned directly (no transformation, no
- * intervening instruction) to that constructor's own field. Deliberately scoped to exactly this
- * shape - the {@code fetchGroup}/{@code GetFabImpl} pattern this was built for - not a general
- * dataflow analysis. Anything wider (a helper-method hop, a branch, a transformation, a
- * multi-level chain, a record-accessor source) fails open: no derived field gets registered, same
- * as today's behavior for that field.
+ * Discovers the "straight-line, one-hop" constructor-flattening pattern: a source value is read
+ * unchanged inside a factory method's bytecode, passed unchanged as one argument to
+ * {@code new SomeOtherClass(...)}, and assigned directly (no transformation, no intervening
+ * instruction) to that constructor's own field. Two source shapes are recognized: a {@code
+ * this.field} read (the {@code fetchGroup}/{@code GetFabImpl} pattern this was originally built
+ * for) and a record accessor call on a record-typed bean injected directly as a method parameter
+ * (e.g. {@code klaProperties.qtimeHourList()}). Deliberately scoped to exactly these two shapes -
+ * not a general dataflow analysis. Anything wider (a helper-method hop, a branch, a
+ * transformation, a multi-level chain, a record-accessor call reached through an intervening
+ * field read) fails open: no derived field gets registered, same as today's behavior for that
+ * field.
  *
  * <p>Read-side private fields (like a {@code @Value} scalar) can only be {@code GETFIELD}'d from
  * within their own declaring class's bytecode - the JVM itself enforces this for private members
- * - so the factory-method pass only needs to scan each source's own class, never the whole
- * application's classes.
+ * - so the field-based pass only needs to scan each source's own class, never the whole
+ * application's classes. The record-accessor pass has no such shortcut (any class holding a
+ * reference to the record bean could call an accessor on it), so it scans every distinct
+ * application bean class instead - still a small, bounded set.
+ *
+ * <p>Bean classes are resolved through {@link ClassUtils#getUserClass(Object)}, not
+ * {@code bean.getClass()}, throughout: a CGLIB-generated runtime class - whether from Spring AOP
+ * proxying ({@code @Transactional}/{@code @Cacheable}/{@code @Async}/AOP-advised beans) or from
+ * plain {@code @Configuration} class enhancement (every {@code @Configuration} class, proxied or
+ * not, to enforce singleton semantics between its own {@code @Bean} methods) - has no loadable
+ * {@code .class} resource and doesn't match the real class name a factory method's bytecode
+ * actually references in its {@code NEW} instruction. {@code ClassUtils.getUserClass()} strips
+ * both by the shared CGLIB naming convention; {@code org.springframework.aop.support.AopUtils
+ * .getTargetClass()} was tried first but only unwraps {@code Advised}/{@code TargetClassAware}
+ * instances, which plain {@code @Configuration} enhancement (not an AOP proxy) never implements -
+ * confirmed empirically to still return the resourceless enhanced subclass for that case.
  */
 final class OneHopFieldCopyScanner {
 
@@ -61,19 +81,16 @@ final class OneHopFieldCopyScanner {
     }
 
     /**
-     * Finds every one-hop derived field for the given source fields, grouped by the bean name
-     * that owns the derived field - ready to be merged into BEAN_FIELDS exactly like
-     * SpringBeanConfigRegistry's other discovery passes. Once registered there, a derived field
-     * is recorded/replayed as an ordinary field - nothing downstream needs to remember where it
-     * came from.
+     * Finds every one-hop derived field for the given source fields and known record source
+     * types, grouped by the bean name that owns the derived field - ready to be merged into
+     * BEAN_FIELDS exactly like SpringBeanConfigRegistry's other discovery passes. Once
+     * registered there, a derived field is recorded/replayed as an ordinary field - nothing
+     * downstream needs to remember where it came from.
      */
     static Map<String, List<Field>> findOneHopCopies(Map<String, Object> applicationBeans,
-            Map<String, List<Field>> sourceFieldsByBean, Map<Field, Class<?>> recordHolderFields) {
-        Map<String, List<Map.Entry<String, Object>>> beansByInternalName = new HashMap<>();
-        for (Map.Entry<String, Object> entry : applicationBeans.entrySet()) {
-            String internalName = Type.getInternalName(entry.getValue().getClass());
-            beansByInternalName.computeIfAbsent(internalName, k -> new ArrayList<>()).add(entry);
-        }
+            Map<String, List<Field>> sourceFieldsByBean, Map<Field, Class<?>> recordHolderFields,
+            Set<Class<?>> recordSourceTypes) {
+        Map<String, List<Map.Entry<String, Object>>> beansByInternalName = groupBeansByRealInternalName(applicationBeans);
 
         Map<String, List<Field>> derivedByBean = new HashMap<>();
         for (Map.Entry<String, List<Field>> beanEntry : sourceFieldsByBean.entrySet()) {
@@ -85,29 +102,66 @@ final class OneHopFieldCopyScanner {
                 if (recordHolderFields.containsKey(sourceField)) {
                     continue; // a record reference field, not a scalar source - out of scope here
                 }
-                // sourceField.getDeclaringClass(), not sourceBean.getClass(): a @Configuration
-                // bean is CGLIB-proxied by Spring by default, so the runtime class has no .class
-                // file resource to read (generated in-memory) - the field's declaring class is
-                // always the original user-written class regardless of proxying, and that's
-                // where the @Bean factory method (inherited, not overridden, by the proxy) is
-                // actually declared.
+                // sourceField.getDeclaringClass(), not AopUtils.getTargetClass(sourceBean): a
+                // @Configuration bean is CGLIB-proxied by Spring by default, so the runtime class
+                // has no .class file resource to read (generated in-memory) - the field's
+                // declaring class is always the original user-written class regardless of
+                // proxying, and that's where the @Bean factory method (inherited, not overridden,
+                // by the proxy) is actually declared.
                 List<ConstructorCallSite> callSites = scanForConstructorPassthrough(sourceField.getDeclaringClass(), sourceField.getName());
-                for (ConstructorCallSite site : callSites) {
-                    List<Map.Entry<String, Object>> targets = beansByInternalName.get(site.targetInternalName);
-                    if (targets == null) {
-                        continue;
-                    }
-                    for (Map.Entry<String, Object> targetEntry : targets) {
-                        Field derivedField = scanConstructorForDirectAssignment(targetEntry.getValue().getClass(), site);
-                        if (derivedField != null) {
-                            derivedField.setAccessible(true);
-                            derivedByBean.computeIfAbsent(targetEntry.getKey(), k -> new ArrayList<>()).add(derivedField);
-                        }
-                    }
+                mergeCallSites(callSites, beansByInternalName, derivedByBean);
+            }
+        }
+
+        if (!recordSourceTypes.isEmpty()) {
+            Set<Class<?>> scannedDeclaringClasses = new HashSet<>();
+            for (Object bean : applicationBeans.values()) {
+                Class<?> declaringClass = ClassUtils.getUserClass(bean);
+                if (!scannedDeclaringClasses.add(declaringClass)) {
+                    continue; // already scanned this declaring class via another bean name
+                }
+                for (Class<?> recordType : recordSourceTypes) {
+                    List<ConstructorCallSite> callSites = scanForRecordAccessorPassthrough(declaringClass, recordType);
+                    mergeCallSites(callSites, beansByInternalName, derivedByBean);
                 }
             }
         }
         return derivedByBean;
+    }
+
+    /**
+     * Resolves through {@link ClassUtils#getUserClass(Object)} rather than {@code getClass()}:
+     * {@code site.targetInternalName} (recorded from a factory method's own {@code NEW}
+     * instruction) is always the real class a bean was constructed as, never a CGLIB-generated
+     * subclass name - so grouping by the raw runtime class would silently drop every proxied or
+     * configuration-enhanced bean from matching.
+     */
+    private static Map<String, List<Map.Entry<String, Object>>> groupBeansByRealInternalName(Map<String, Object> applicationBeans) {
+        Map<String, List<Map.Entry<String, Object>>> beansByInternalName = new HashMap<>();
+        for (Map.Entry<String, Object> entry : applicationBeans.entrySet()) {
+            String internalName = Type.getInternalName(ClassUtils.getUserClass(entry.getValue()));
+            beansByInternalName.computeIfAbsent(internalName, k -> new ArrayList<>()).add(entry);
+        }
+        return beansByInternalName;
+    }
+
+    private static void mergeCallSites(List<ConstructorCallSite> callSites,
+            Map<String, List<Map.Entry<String, Object>>> beansByInternalName, Map<String, List<Field>> derivedByBean) {
+        for (ConstructorCallSite site : callSites) {
+            List<Map.Entry<String, Object>> targets = beansByInternalName.get(site.targetInternalName);
+            if (targets == null) {
+                continue;
+            }
+            for (Map.Entry<String, Object> targetEntry : targets) {
+                // ClassUtils.getUserClass(), not getClass(): same CGLIB issue as above, this
+                // time on the read side - a generated subclass's runtime class has no .class resource.
+                Field derivedField = scanConstructorForDirectAssignment(ClassUtils.getUserClass(targetEntry.getValue()), site);
+                if (derivedField != null) {
+                    derivedField.setAccessible(true);
+                    derivedByBean.computeIfAbsent(targetEntry.getKey(), k -> new ArrayList<>()).add(derivedField);
+                }
+            }
+        }
     }
 
     private static List<ConstructorCallSite> scanForConstructorPassthrough(Class<?> ownerClass, String sourceFieldName) {
@@ -128,6 +182,51 @@ final class OneHopFieldCopyScanner {
             LogManager.warn("spring.bean.config.dataflow.scan.error", t);
         }
         return found;
+    }
+
+    /**
+     * Scans every method of ownerClass for a record-typed parameter (matching recordType) having
+     * one of its own accessor methods called and the result passed unchanged as a constructor
+     * argument - the {@code klaProperties.qtimeHourList()} shape. Unlike
+     * {@link #scanForConstructorPassthrough}, this isn't restricted to one declaring class per
+     * source (any class holding a reference to the record bean could call an accessor on it), so
+     * the caller scans every application bean class, not just one.
+     */
+    private static List<ConstructorCallSite> scanForRecordAccessorPassthrough(Class<?> ownerClass, Class<?> recordType) {
+        List<ConstructorCallSite> found = new ArrayList<>();
+        byte[] bytecode = readBytecode(ownerClass);
+        if (bytecode == null) {
+            return found;
+        }
+        Set<String> accessorNames = recordComponentAccessorNames(recordType);
+        if (accessorNames.isEmpty()) {
+            return found;
+        }
+        String recordInternalName = Type.getInternalName(recordType);
+        try {
+            new ClassReader(bytecode).accept(new ClassVisitor(Opcodes.ASM9) {
+                @Override
+                public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
+                    return new RecordAccessorPassthroughDetector(recordInternalName, accessorNames, access, descriptor, found);
+                }
+            }, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+        } catch (Throwable t) {
+            LogManager.warn("spring.bean.config.dataflow.scan.error", t);
+        }
+        return found;
+    }
+
+    private static Set<String> recordComponentAccessorNames(Class<?> recordType) {
+        try {
+            RecordComponent[] components = recordType.getRecordComponents();
+            Set<String> names = new HashSet<>();
+            for (RecordComponent component : components) {
+                names.add(component.getName());
+            }
+            return names;
+        } catch (Throwable t) {
+            return Collections.emptySet();
+        }
     }
 
     private static Field scanConstructorForDirectAssignment(Class<?> targetClass, ConstructorCallSite site) {
@@ -368,6 +467,237 @@ final class OneHopFieldCopyScanner {
         @Override
         public void visitMethodInsn(int opcode, String owner, String name, String descriptor, boolean isInterface) {
             if (!collectingArgs) {
+                return;
+            }
+            if (opcode == Opcodes.INVOKESPECIAL && "<init>".equals(name) && owner.equals(pendingNewType)) {
+                flushPendingLoad();
+                if (!aborted && sawSource) {
+                    localFound.add(new ConstructorCallSite(owner, descriptor, sourceArgPosition));
+                }
+                reset();
+                return;
+            }
+            flushPendingLoad();
+            aborted = true; // any other method call used to compute an argument
+        }
+
+        @Override
+        public void visitJumpInsn(int opcode, Label label) {
+            methodHasBranch = true;
+            if (collectingArgs) {
+                flushPendingLoad();
+                aborted = true;
+            }
+        }
+
+        @Override
+        public void visitTableSwitchInsn(int min, int max, Label dflt, Label... labels) {
+            methodHasBranch = true;
+        }
+
+        @Override
+        public void visitLookupSwitchInsn(Label dflt, int[] keys, Label[] labels) {
+            methodHasBranch = true;
+        }
+    }
+
+    /**
+     * Record-accessor variant of {@link PassthroughDetector}: same straight-line, one-argument,
+     * branch-disqualifies-the-method tracking, but the atomic source push recognized here is
+     * {@code ALOAD <paramSlot>} - a record-typed method parameter, not necessarily {@code this} -
+     * immediately followed by an {@code INVOKEVIRTUAL}/{@code INVOKEINTERFACE} call to one of
+     * that record's own accessor methods (e.g. {@code klaProperties.qtimeHourList()}), rather
+     * than a {@code this.field} GETFIELD. An ordinary {@code ALOAD + GETFIELD} combo (some other
+     * field read used as a different argument) is still accepted as an atomic, non-source
+     * argument, same as {@link PassthroughDetector} - only a record-param load followed by a
+     * matching accessor call is treated as the tracked source.
+     */
+    private static final class RecordAccessorPassthroughDetector extends MethodVisitor {
+        private final String recordInternalName;
+        private final Set<String> accessorNames;
+        private final Set<Integer> recordParamSlots;
+        private final List<ConstructorCallSite> found;
+        private final List<ConstructorCallSite> localFound = new ArrayList<>();
+        private boolean methodHasBranch;
+
+        private String pendingNewType;
+        private boolean collectingArgs;
+        private int argCount;
+        private boolean sawSource;
+        private int sourceArgPosition = -1;
+        private boolean aborted;
+        private int pendingObjectRefSlot = -1;
+
+        RecordAccessorPassthroughDetector(String recordInternalName, Set<String> accessorNames,
+                int access, String descriptor, List<ConstructorCallSite> found) {
+            super(Opcodes.ASM9);
+            this.recordInternalName = recordInternalName;
+            this.accessorNames = accessorNames;
+            this.found = found;
+            this.recordParamSlots = matchedParamSlots(recordInternalName, access, descriptor);
+        }
+
+        private static Set<Integer> matchedParamSlots(String recordInternalName, int access, String descriptor) {
+            Set<Integer> slots = new HashSet<>();
+            Type[] argTypes = Type.getArgumentTypes(descriptor);
+            int slot = (access & Opcodes.ACC_STATIC) != 0 ? 0 : 1; // instance methods start past `this`
+            for (Type argType : argTypes) {
+                if (argType.getSort() == Type.OBJECT && argType.getInternalName().equals(recordInternalName)) {
+                    slots.add(slot);
+                }
+                slot += argType.getSize();
+            }
+            return slots;
+        }
+
+        @Override
+        public void visitEnd() {
+            if (!methodHasBranch) {
+                found.addAll(localFound);
+            }
+        }
+
+        private void flushPendingLoad() {
+            if (pendingObjectRefSlot != -1) {
+                argCount++; // a bare object reference load, never followed by a matching combo - its own atomic argument
+                pendingObjectRefSlot = -1;
+            }
+        }
+
+        private void reset() {
+            pendingNewType = null;
+            collectingArgs = false;
+            argCount = 0;
+            sawSource = false;
+            sourceArgPosition = -1;
+            aborted = false;
+            pendingObjectRefSlot = -1;
+        }
+
+        @Override
+        public void visitTypeInsn(int opcode, String type) {
+            if (opcode != Opcodes.NEW) {
+                if (collectingArgs) {
+                    flushPendingLoad();
+                    aborted = true;
+                }
+                return;
+            }
+            if (collectingArgs) {
+                flushPendingLoad();
+                aborted = true;
+                return;
+            }
+            pendingNewType = type;
+        }
+
+        @Override
+        public void visitInsn(int opcode) {
+            if (opcode == Opcodes.DUP && pendingNewType != null && !collectingArgs) {
+                collectingArgs = true;
+                argCount = 0;
+                sawSource = false;
+                sourceArgPosition = -1;
+                aborted = false;
+                pendingObjectRefSlot = -1;
+                return;
+            }
+            if (!collectingArgs) {
+                return;
+            }
+            flushPendingLoad();
+            if (aborted) {
+                return;
+            }
+            if (ATOMIC_ZERO_OPERAND_PUSHES.contains(opcode)) {
+                argCount++;
+            } else {
+                aborted = true;
+            }
+        }
+
+        @Override
+        public void visitVarInsn(int opcode, int var) {
+            if (!collectingArgs) {
+                return;
+            }
+            flushPendingLoad();
+            if (aborted) {
+                return;
+            }
+            if (opcode == Opcodes.ALOAD) {
+                pendingObjectRefSlot = var; // might be immediately consumed by a matching accessor call
+            } else if (opcode >= Opcodes.ILOAD && opcode < Opcodes.ALOAD) {
+                argCount++;
+            } else {
+                aborted = true; // a STORE mid-argument-list - not straight-line enough
+            }
+        }
+
+        @Override
+        public void visitFieldInsn(int opcode, String owner, String name, String descriptor) {
+            if (!collectingArgs) {
+                return;
+            }
+            if (opcode == Opcodes.GETFIELD && pendingObjectRefSlot != -1) {
+                pendingObjectRefSlot = -1;
+                if (!aborted) {
+                    argCount++; // an unrelated `x.field` read used for a different argument - still atomic
+                }
+                return;
+            }
+            flushPendingLoad();
+            if (aborted) {
+                return;
+            }
+            if (opcode == Opcodes.GETSTATIC) {
+                argCount++;
+            } else {
+                aborted = true;
+            }
+        }
+
+        @Override
+        public void visitLdcInsn(Object value) {
+            if (!collectingArgs) {
+                return;
+            }
+            flushPendingLoad();
+            if (!aborted) {
+                argCount++;
+            }
+        }
+
+        @Override
+        public void visitIntInsn(int opcode, int operand) {
+            if (!collectingArgs) {
+                return;
+            }
+            flushPendingLoad();
+            if (aborted) {
+                return;
+            }
+            if (opcode == Opcodes.BIPUSH || opcode == Opcodes.SIPUSH) {
+                argCount++;
+            } else {
+                aborted = true;
+            }
+        }
+
+        @Override
+        public void visitMethodInsn(int opcode, String owner, String name, String descriptor, boolean isInterface) {
+            if (!collectingArgs) {
+                return;
+            }
+            if ((opcode == Opcodes.INVOKEVIRTUAL || opcode == Opcodes.INVOKEINTERFACE)
+                    && pendingObjectRefSlot != -1 && recordParamSlots.contains(pendingObjectRefSlot)
+                    && owner.equals(recordInternalName) && accessorNames.contains(name)) {
+                pendingObjectRefSlot = -1;
+                if (!aborted) {
+                    sawSource = true;
+                    sourceArgPosition = argCount;
+                    argCount++;
+                }
                 return;
             }
             if (opcode == Opcodes.INVOKESPECIAL && "<init>".equals(name) && owner.equals(pendingNewType)) {

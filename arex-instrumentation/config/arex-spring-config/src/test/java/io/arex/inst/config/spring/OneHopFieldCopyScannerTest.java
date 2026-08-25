@@ -164,7 +164,7 @@ class OneHopFieldCopyScannerTest {
         Field sourceField = Source.class.getDeclaredField("fetchGroup");
 
         Map<String, List<Field>> result = OneHopFieldCopyScanner.findOneHopCopies(
-                applicationBeans, sourceFields("source", sourceField), Collections.emptyMap());
+                applicationBeans, sourceFields("source", sourceField), Collections.emptyMap(), Collections.emptySet());
 
         assertTrue(result.containsKey("target"), "expected the target bean to gain a derived field");
         List<Field> derived = result.get("target");
@@ -181,7 +181,7 @@ class OneHopFieldCopyScannerTest {
         Field sourceField = TransformSource.class.getDeclaredField("value");
 
         Map<String, List<Field>> result = OneHopFieldCopyScanner.findOneHopCopies(
-                applicationBeans, sourceFields("source", sourceField), Collections.emptyMap());
+                applicationBeans, sourceFields("source", sourceField), Collections.emptyMap(), Collections.emptySet());
 
         assertTrue(result.isEmpty(), "a transformed value must not be treated as a direct passthrough");
     }
@@ -195,7 +195,7 @@ class OneHopFieldCopyScannerTest {
         Field sourceField = HelperSource.class.getDeclaredField("value");
 
         Map<String, List<Field>> result = OneHopFieldCopyScanner.findOneHopCopies(
-                applicationBeans, sourceFields("source", sourceField), Collections.emptyMap());
+                applicationBeans, sourceFields("source", sourceField), Collections.emptyMap(), Collections.emptySet());
 
         assertTrue(result.isEmpty(), "an extra method-call hop must not be treated as a one-hop passthrough");
     }
@@ -209,7 +209,7 @@ class OneHopFieldCopyScannerTest {
         Field sourceField = BranchSource.class.getDeclaredField("value");
 
         Map<String, List<Field>> result = OneHopFieldCopyScanner.findOneHopCopies(
-                applicationBeans, sourceFields("source", sourceField), Collections.emptyMap());
+                applicationBeans, sourceFields("source", sourceField), Collections.emptyMap(), Collections.emptySet());
 
         assertTrue(result.isEmpty(), "a branch anywhere in the factory method must disqualify every match found in it");
     }
@@ -223,7 +223,7 @@ class OneHopFieldCopyScannerTest {
         Field sourceField = CtorBranchSource.class.getDeclaredField("value");
 
         Map<String, List<Field>> result = OneHopFieldCopyScanner.findOneHopCopies(
-                applicationBeans, sourceFields("source", sourceField), Collections.emptyMap());
+                applicationBeans, sourceFields("source", sourceField), Collections.emptyMap(), Collections.emptySet());
 
         assertTrue(result.isEmpty(), "a branch inside the target constructor must disqualify the match");
     }
@@ -237,8 +237,169 @@ class OneHopFieldCopyScannerTest {
 
         Map<String, Object> applicationBeans = beans("source", source);
         Map<String, List<Field>> result = OneHopFieldCopyScanner.findOneHopCopies(
-                applicationBeans, sourceFields("source", sourceField), recordHolderFields);
+                applicationBeans, sourceFields("source", sourceField), recordHolderFields, Collections.emptySet());
 
         assertTrue(result.isEmpty());
+    }
+
+    // ---- Fix A: target bean is a CGLIB proxy (e.g. @Transactional/@Cacheable/@Async/@Aspect-advised) ----
+
+    interface ProxiedTarget {
+        String fetchGroup();
+    }
+
+    static class ProxiedTargetImpl implements ProxiedTarget {
+        private final Gateway gateway;
+        private final String fetchGroup;
+
+        ProxiedTargetImpl(Gateway gateway, String fetchGroup) {
+            this.gateway = gateway;
+            this.fetchGroup = fetchGroup;
+        }
+
+        @Override
+        public String fetchGroup() {
+            return fetchGroup;
+        }
+    }
+
+    static class ProxiedSource {
+        private final String fetchGroup;
+
+        ProxiedSource(String fetchGroup) {
+            this.fetchGroup = fetchGroup;
+        }
+
+        ProxiedTargetImpl makeTarget(Gateway gateway) {
+            return new ProxiedTargetImpl(gateway, fetchGroup);
+        }
+    }
+
+    @Test
+    void findOneHopCopies_detectsMatchWhenTargetIsACglibProxy() throws Exception {
+        ProxiedSource source = new ProxiedSource("team-a");
+        Gateway gateway = new Gateway();
+        ProxiedTargetImpl real = source.makeTarget(gateway);
+
+        org.springframework.aop.framework.ProxyFactory proxyFactory = new org.springframework.aop.framework.ProxyFactory(real);
+        proxyFactory.setProxyTargetClass(true);
+        Object proxied = proxyFactory.getProxy();
+        assertTrue(org.springframework.aop.support.AopUtils.isCglibProxy(proxied), "fixture must actually be a CGLIB proxy");
+
+        Map<String, Object> applicationBeans = beans("source", source, "target", proxied);
+        Field sourceField = ProxiedSource.class.getDeclaredField("fetchGroup");
+
+        Map<String, List<Field>> result = OneHopFieldCopyScanner.findOneHopCopies(
+                applicationBeans, sourceFields("source", sourceField), Collections.emptyMap(), Collections.emptySet());
+
+        assertTrue(result.containsKey("target"), "a CGLIB-proxied target must still be matched, not silently dropped");
+        assertEquals("fetchGroup", result.get("target").get(0).getName());
+    }
+
+    // ---- Fix B: record accessor call on a directly-injected record parameter ----
+
+    record TimeProperties(String timeHourList) {
+    }
+
+    static class TimeHoursTarget {
+        private final String timeHourList;
+
+        TimeHoursTarget(String timeHourList) {
+            this.timeHourList = timeHourList;
+        }
+    }
+
+    static class TimeHoursFactory {
+        TimeHoursTarget makeTarget(TimeProperties timeProperties) {
+            return new TimeHoursTarget(timeProperties.timeHourList());
+        }
+    }
+
+    @Test
+    void findOneHopCopies_detectsRecordAccessorPassthrough() throws Exception {
+        TimeHoursFactory factory = new TimeHoursFactory();
+        TimeProperties timeProperties = new TimeProperties("09:00-18:00");
+        TimeHoursTarget target = factory.makeTarget(timeProperties);
+
+        Map<String, Object> applicationBeans = beans("factory", factory, "target", target);
+
+        Map<String, List<Field>> result = OneHopFieldCopyScanner.findOneHopCopies(
+                applicationBeans, Collections.emptyMap(), Collections.emptyMap(),
+                Collections.singleton(TimeProperties.class));
+
+        assertTrue(result.containsKey("target"), "expected the target bean to gain a derived field");
+        assertEquals("timeHourList", result.get("target").get(0).getName());
+    }
+
+    static class TimeHoursTransformFactory {
+        TimeHoursTarget makeTarget(TimeProperties timeProperties) {
+            return new TimeHoursTarget(timeProperties.timeHourList().trim());
+        }
+    }
+
+    @Test
+    void findOneHopCopies_doesNotMatchWhenRecordAccessorValueIsTransformed() throws Exception {
+        TimeHoursTransformFactory factory = new TimeHoursTransformFactory();
+        TimeProperties timeProperties = new TimeProperties("09:00-18:00");
+        TimeHoursTarget target = factory.makeTarget(timeProperties);
+
+        Map<String, Object> applicationBeans = beans("factory", factory, "target", target);
+
+        Map<String, List<Field>> result = OneHopFieldCopyScanner.findOneHopCopies(
+                applicationBeans, Collections.emptyMap(), Collections.emptyMap(),
+                Collections.singleton(TimeProperties.class));
+
+        assertTrue(result.isEmpty(), "a transformed record-accessor value must not be treated as a direct passthrough");
+    }
+
+    static class TimeHoursBranchFactory {
+        TimeHoursTarget makeTarget(TimeProperties timeProperties, boolean flag) {
+            if (flag) {
+                return new TimeHoursTarget(timeProperties.timeHourList());
+            }
+            return new TimeHoursTarget("default");
+        }
+    }
+
+    @Test
+    void findOneHopCopies_doesNotMatchWhenRecordAccessorFactoryMethodBranches() throws Exception {
+        TimeHoursBranchFactory factory = new TimeHoursBranchFactory();
+        TimeProperties timeProperties = new TimeProperties("09:00-18:00");
+        TimeHoursTarget target = factory.makeTarget(timeProperties, true);
+
+        Map<String, Object> applicationBeans = beans("factory", factory, "target", target);
+
+        Map<String, List<Field>> result = OneHopFieldCopyScanner.findOneHopCopies(
+                applicationBeans, Collections.emptyMap(), Collections.emptyMap(),
+                Collections.singleton(TimeProperties.class));
+
+        assertTrue(result.isEmpty(), "a branch anywhere in the factory method must disqualify every match found in it");
+    }
+
+    static class TimeHoursHolder {
+        private final TimeProperties timeProperties;
+
+        TimeHoursHolder(TimeProperties timeProperties) {
+            this.timeProperties = timeProperties;
+        }
+
+        TimeHoursTarget makeTarget() {
+            return new TimeHoursTarget(timeProperties.timeHourList());
+        }
+    }
+
+    @Test
+    void findOneHopCopies_doesNotMatchRecordAccessorReachedThroughAHolderField() throws Exception {
+        TimeProperties timeProperties = new TimeProperties("09:00-18:00");
+        TimeHoursHolder holder = new TimeHoursHolder(timeProperties);
+        TimeHoursTarget target = holder.makeTarget();
+
+        Map<String, Object> applicationBeans = beans("holder", holder, "target", target);
+
+        Map<String, List<Field>> result = OneHopFieldCopyScanner.findOneHopCopies(
+                applicationBeans, Collections.emptyMap(), Collections.emptyMap(),
+                Collections.singleton(TimeProperties.class));
+
+        assertTrue(result.isEmpty(), "a two-hop this.holderField.accessor() chain is out of scope and must not match");
     }
 }

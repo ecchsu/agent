@@ -1,6 +1,7 @@
 package io.arex.inst.config.spring;
 
 import io.arex.inst.runtime.log.LogManager;
+import org.springframework.aop.framework.Advised;
 import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -74,6 +75,7 @@ public class SpringBeanConfigRegistry {
             if (bean == null) {
                 continue; // not a singleton, or not yet instantiated (e.g. lazy) - out of scope for now
             }
+            bean = unwrapProxyTarget(bean);
             if (bean.getClass().getName().startsWith(FRAMEWORK_PACKAGE_PREFIX)) {
                 continue;
             }
@@ -105,12 +107,15 @@ public class SpringBeanConfigRegistry {
             }
         }
 
-        // One-hop constructor-flattening: a value read from a known source field and passed
-        // unchanged into another bean's constructor, cached in that bean's own field (e.g.
-        // fetchGroup -> GetFabImpl.fetchGroup). Runs last, since it needs BEAN_FIELDS/
-        // RECORD_HOLDER_FIELDS above already populated as its set of known sources.
+        // One-hop constructor-flattening: a value read from a known source field, or a record
+        // accessor call on a known record-typed source, passed unchanged into another bean's
+        // constructor, cached in that bean's own field (e.g. fetchGroup -> GetFabImpl.fetchGroup,
+        // or klaProperties.qtimeHourList() -> GetKlaQTimeHoursUseCaseImpl.klaQTimeHourListConfig).
+        // Runs last, since it needs BEAN_FIELDS/RECORD_HOLDER_FIELDS above already populated as
+        // its set of known field sources; recordSourcesByType (from the first pass, above) is its
+        // set of known record-typed sources.
         Map<String, List<Field>> derivedFields = OneHopFieldCopyScanner.findOneHopCopies(
-                applicationBeans, BEAN_FIELDS, RECORD_HOLDER_FIELDS);
+                applicationBeans, BEAN_FIELDS, RECORD_HOLDER_FIELDS, recordSourcesByType.keySet());
         for (Map.Entry<String, List<Field>> derivedEntry : derivedFields.entrySet()) {
             String beanName = derivedEntry.getKey();
             List<Field> existing = BEAN_FIELDS.get(beanName);
@@ -164,6 +169,33 @@ public class SpringBeanConfigRegistry {
             current = current.getSuperclass();
         }
         return holderFields != null ? holderFields : fields;
+    }
+
+    /**
+     * A Spring AOP proxy (CGLIB or JDK dynamic) does not share field storage with the object it
+     * wraps: reflection on an inherited field of a CGLIB proxy reads/writes the proxy's own,
+     * disconnected copy of that field slot, never the wrapped target's - confirmed experimentally
+     * (a reflective write to the proxy left a subsequent method call, which delegates to the
+     * real target, still returning the pre-write value). A JDK dynamic proxy doesn't even have
+     * the field at all (a {@code java.lang.reflect.Proxy} has no inherited fields from the
+     * interfaces it implements). Every reflective read/write in this feature - both here and in
+     * SpringBeanConfigExtractor - needs to operate on the real, wrapped target instance, so it's
+     * unwrapped once, here, before the bean ever enters applicationBeans; everything downstream
+     * (including OneHopFieldCopyScanner's own class-level unwrapping, needed only for bytecode
+     * resource loading and internal-name matching) then sees a plain, non-proxied object.
+     */
+    private static Object unwrapProxyTarget(Object bean) {
+        if (bean instanceof Advised) {
+            try {
+                Object target = ((Advised) bean).getTargetSource().getTarget();
+                if (target != null) {
+                    return target;
+                }
+            } catch (Exception e) {
+                LogManager.warn("spring.bean.config.registry.unwrap.error", e);
+            }
+        }
+        return bean;
     }
 
     private static List<Field> eligibleFields(Class<?> beanClass) {

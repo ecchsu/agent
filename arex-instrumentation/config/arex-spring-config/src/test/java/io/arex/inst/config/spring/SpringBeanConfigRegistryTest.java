@@ -104,4 +104,79 @@ class SpringBeanConfigRegistryTest {
         assertEquals(1, SpringBeanConfigRegistry.beanFields().get("plain").size());
         assertTrue(SpringBeanConfigRegistry.recordHolderFields().isEmpty());
     }
+
+    /**
+     * Confirmed experimentally (not just reasoned about): a reflective write to a CGLIB proxy's
+     * own inherited field never reaches the wrapped target - a subsequent method call, which
+     * delegates to the real target, still returns the pre-write value. Every reflective
+     * read/write this feature performs needs the real target instance, not the proxy.
+     */
+    @Test
+    void initialize_unwrapsAopProxiedBeanToItsRealTargetInstance() {
+        PlainBean plain = new PlainBean();
+        org.springframework.aop.framework.ProxyFactory proxyFactory = new org.springframework.aop.framework.ProxyFactory(plain);
+        proxyFactory.setProxyTargetClass(true);
+        Object proxy = proxyFactory.getProxy();
+
+        SpringBeanConfigRegistry.initialize(contextFor(Map.of("plain", proxy)));
+
+        Object registered = SpringBeanConfigRegistry.beanInstances().get("plain");
+        assertTrue(registered == plain, "a proxied bean must be unwrapped to its real target "
+                + "instance so reflective field access actually reaches the wrapped target");
+    }
+
+    /**
+     * Every {@code @Configuration} class is CGLIB-enhanced by Spring by default (to enforce
+     * singleton semantics between its own {@code @Bean} methods), whether or not it's also an
+     * AOP-advised bean - the enhanced instance's runtime class has no loadable {@code .class}
+     * resource, exactly like an AOP proxy, but doesn't implement {@code Advised} at all. A
+     * plain-fixture unit test (a config class instantiated with a bare {@code new}) can't
+     * exercise this - it was found only by bootstrapping a real Spring context. Regression guard:
+     * boots a minimal real context with a record-typed {@code @ConfigurationProperties} source
+     * injected directly as a {@code @Bean} factory method parameter, its accessor's return value
+     * passed straight into another bean's constructor - the exact shape that silently found zero
+     * matches when class resolution didn't survive {@code @Configuration} enhancement.
+     */
+    @Test
+    void initialize_findsRecordAccessorDerivedField_throughRealConfigurationClassEnhancement() {
+        try (org.springframework.context.annotation.AnnotationConfigApplicationContext realContext =
+                new org.springframework.context.annotation.AnnotationConfigApplicationContext(RealConfig.class)) {
+            Map<String, Object> beans = Map.of(
+                    "props", realContext.getBean(RealConfig.RecordSource.class),
+                    "config", realContext.getBean(RealConfig.class),
+                    "target", realContext.getBean(RealConfig.Target.class));
+
+            SpringBeanConfigRegistry.initialize(contextFor(beans));
+
+            List<Field> targetFields = SpringBeanConfigRegistry.beanFields().get("target");
+            assertTrue(targetFields != null && targetFields.stream().anyMatch(f -> f.getName().equals("value")),
+                    "expected the record-accessor-derived field on the real @Configuration-enhanced "
+                            + "factory's target bean to be discovered");
+        }
+    }
+
+    @org.springframework.context.annotation.Configuration
+    static class RealConfig {
+        @org.springframework.boot.context.properties.ConfigurationProperties(prefix = "realconfig")
+        record RecordSource(String value) {
+        }
+
+        @org.springframework.context.annotation.Bean
+        RecordSource recordSource() {
+            return new RecordSource("hello");
+        }
+
+        static class Target {
+            private final String value;
+
+            Target(String value) {
+                this.value = value;
+            }
+        }
+
+        @org.springframework.context.annotation.Bean
+        Target target(RecordSource recordSource) {
+            return new Target(recordSource.value());
+        }
+    }
 }

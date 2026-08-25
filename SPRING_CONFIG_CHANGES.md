@@ -136,6 +136,146 @@ distinct local config, both via direct `arex-record-id` header requests and via 
 `createPlan` schedule-service webhook): every request correctly used its own recorded
 config, with zero cross-contamination.
 
+## Phase 3: CGLIB/`@Configuration`-enhancement class+instance resolution, and record-accessor one-hop discovery
+
+Two real, independent bugs found via real-app testing (investigation trail below), both fixed and
+verified live. Neither was caught by Phase 2's unit tests, since those use plain, non-proxied
+fixture classes — the demo app has since been extended with fixtures that actually exercise both
+(see "Verified live" below).
+
+**Bug A — CGLIB/AOP-proxy and `@Configuration`-enhancement break the target side of the one-hop
+scanner, at two different levels.** Fixing this took two attempts:
+
+1. First attempt: `findOneHopCopies()` grouped candidate targets by
+   `Type.getInternalName(entry.getValue().getClass())` and read bytecode via
+   `targetEntry.getValue().getClass()` — both the bean's *runtime* class. For an AOP-advised bean
+   (any `@Transactional`/`@Cacheable`/`@Async`/`@Aspect`-matched bean), this is a generated CGLIB
+   subclass with no loadable `.class` resource, that doesn't match `site.targetInternalName`
+   (always the real class, since that's what the factory method's `NEW` instruction actually
+   names). Tried `org.springframework.aop.support.AopUtils.getTargetClass(bean)` in place of
+   `bean.getClass()`.
+2. That alone wasn't sufficient, for two separate reasons, both found empirically (not just
+   reasoned about) against the real demo app:
+   - `AopUtils.getTargetClass()` only unwraps `Advised`/`TargetClassAware` instances. Every
+     `@Configuration` class is *also* CGLIB-enhanced by Spring by default (to enforce singleton
+     semantics between its own `@Bean` methods) — but that enhancement is not an AOP proxy and
+     doesn't implement `Advised`, so `AopUtils.getTargetClass()` still returned the resourceless
+     enhanced subclass for it (confirmed with a standalone repro:
+     `AnnotationConfigApplicationContext` + a plain `@Configuration` class → `getTargetClass()`
+     returned the same unusable `MyConfig$$SpringCGLIB$$0`). Fixed by switching to
+     `org.springframework.util.ClassUtils.getUserClass()` throughout, which strips *any* CGLIB
+     naming-convention subclass — AOP proxy or plain configuration enhancement alike — confirmed to
+     correctly resolve both cases via the same standalone repro.
+   - Separately, and more fundamentally: **a CGLIB proxy does not share field storage with the
+     object it wraps.** Reflection on a proxy's own inherited field reads/writes the proxy's own,
+     disconnected copy — never the wrapped target. Confirmed experimentally (`ProxyFactory` +
+     `setProxyTargetClass(true)`, then `Field.set(proxy, ...)`: a subsequent method call on the
+     proxy, which delegates to the real target, still returned the pre-write value). Class-level
+     resolution alone (the fix above) finds the *right field*, but reading/writing it on the proxy
+     instance itself is still a silent no-op. Fixed by unwrapping the bean *instance* once, in
+     `SpringBeanConfigRegistry.scan()`, before it ever enters `applicationBeans` — via
+     `((Advised) bean).getTargetSource().getTarget()` when the bean implements `Advised`. This also
+     retroactively fixes the same latent gap for any *plain* `@Value`/`@ConfigurationProperties`
+     field on an AOP-advised bean (Phase 0/1), not just derived fields.
+
+**Bug B — a record accessor call isn't a recognized source (new discovery capability).** A
+record-typed bean (e.g. `KlaProperties`) injected directly as a `@Bean` factory method's parameter,
+with one of its accessor methods called (`klaProperties.qtimeHourList()`) and the result passed
+unchanged into another bean's constructor. `PassthroughDetector` only recognized `GETFIELD` as an
+atomic source push; any other method call, including a record accessor, aborted the match.
+
+New `RecordAccessorPassthroughDetector` (sibling to `PassthroughDetector`, same straight-line/
+branch-disqualification skeleton): recognizes `ALOAD <paramSlot>` (any parameter slot, not just
+`this`) immediately followed by `INVOKEVIRTUAL`/`INVOKEINTERFACE` calling one of a known record
+type's own accessor methods (matched via `Class.getRecordComponents()`) as one atomic argument
+push. Reuses the existing `DirectAssignmentDetector`/`scanConstructorForDirectAssignment` for the
+target side unchanged. `SpringBeanConfigRegistry.scan()` now threads `recordSourcesByType.keySet()`
+(already built for Phase 1) into `OneHopFieldCopyScanner.findOneHopCopies()` as a new parameter,
+enabling this second discovery pass alongside the existing field-based one. Once discovered, a
+derived field merges into `BEAN_FIELDS` exactly like any other — no `SpringBeanConfigExtractor`
+change needed, same as Phase 2. Scoped exactly to a directly-injected record parameter with one
+accessor call; a `this.recordHolderField.accessor()` two-hop chain is unevidenced and deliberately
+out of scope, same fail-open philosophy as the rest of this scanner.
+
+| File | Change |
+|---|---|
+| `OneHopFieldCopyScanner.java` | `findOneHopCopies()` gains a `Set<Class<?>> recordSourceTypes` parameter and a second discovery pass; class-level resolution throughout (`groupBeansByRealInternalName()`, the target-side lookup in the new `mergeCallSites()` helper, and the new pass's own iteration) uses `ClassUtils.getUserClass()`. New `RecordAccessorPassthroughDetector`, `scanForRecordAccessorPassthrough()`, `recordComponentAccessorNames()`. |
+| `SpringBeanConfigRegistry.java` | New `unwrapProxyTarget()`, called on every bean right after retrieval from the bean factory, before it enters `applicationBeans` — unwraps an `Advised` (AOP) proxy to its real target instance. `scan()` passes `recordSourcesByType.keySet()` into `findOneHopCopies()`. |
+
+**Tests:** `OneHopFieldCopyScannerTest.java` gained a CGLIB-proxy positive case (via `ProxyFactory`
++ `setProxyTargetClass(true)`) and a record-accessor positive case plus three negative fixtures
+(transformation, branch, two-hop holder-field chain). `SpringBeanConfigRegistryTest.java` gained
+`initialize_unwrapsAopProxiedBeanToItsRealTargetInstance` (confirms the registered instance is the
+real target, `== plain`, not the proxy) and
+`initialize_findsRecordAccessorDerivedField_throughRealConfigurationClassEnhancement` (boots a real
+`AnnotationConfigApplicationContext` with an actual `@Configuration` class, the only way to
+exercise real CGLIB enhancement rather than a plain-fixture stand-in — confirmed this test fails
+with `AopUtils.getTargetClass()` alone and passes with `ClassUtils.getUserClass()`, proving it's a
+genuine regression guard for the exact bug found).
+
+**Verified live** against `../arex-spring-config-demo`, extended with two new fixtures matching
+the real-app shapes exactly: `GetFabProxied`/`GetFabProxiedImpl` + `/api/fetch-group-proxied`
+(Bug A — `LoggingAspect`, a trivial `@Aspect`, forces a genuine CGLIB proxy; confirmed via its own
+log line firing on each call) and `GetTimeHours`/`GetTimeHoursImpl` + `/api/time-hours` (Bug B —
+reuses the existing `KProperties` record). Recorded both at one local config, changed local config,
+replayed the same case both directly (`arex-record-id` header) and via the actual `createPlan`
+webhook (plan `6a8d92c3b0fb652e034683b4`) — all four endpoints (these two plus the pre-existing
+`/api/fetch-group`, `/api/k-properties`) passed clean in the AREX UI, zero regression.
+
+Also verified at larger scale under genuine concurrent, multi-environment replay: recorded 20
+distinct simulated environments (one JVM restart per environment, one hit per endpoint each — first
+hit per URI per JVM run always succeeds under AREX's own per-operation `RecordLimiter`, one
+recording per 60s window), 80 cases total, 20 per endpoint, each environment's `demo.allow-fab`/
+`demo.k.time-hour-list` distinct from every other's. Started a single replay-target instance with
+yet another, 21st distinct ("wrong") local config, then fired all 80 recorded cases concurrently
+(via direct `arex-record-id` header requests, backgrounded and awaited together) against that one
+instance. Result: 80/80 passed — every case reflected its own originally-recorded environment's
+config, not the replay target's local config and not any other environment's, across all four
+endpoints.
+
+## Investigation trail: how Bugs A and B were found (2026-08-25)
+
+After Phase 0-2 were pushed (`174ca7ef`), the pushed agent was run against the user's actual
+production app (not the demo) and traffic still replayed against local config for at least two
+endpoints. The replay ran on a different machine, so the only evidence available was a
+screenshot-photographed analysis from a different AI session with access to that log. Reviewed
+here (11 photos) and checked claim-by-claim against this repo's actual source before acting on
+any of it.
+
+**Claim found to be false, disregarded:** the analysis asserted `SpringBeanConfigExtractor
+.setFieldValue()` (cited at line 242, matching this file's actual line number for that method)
+uses `sun.misc.Unsafe` to clear a field's `final` modifier before writing, and that this fails
+under JDK 17's strong encapsulation. Checked directly: the real method at that line is `field.set
+(bean, value)` wrapped in a try/catch for `IllegalAccessException` — no `Unsafe`, no modifier
+manipulation, anywhere in this module (confirmed by grep). Same cited line number, entirely
+different, non-existent code — the "Unsafe" failure mode was invented, not observed. Whatever
+build produced the log the other AI analyzed, it either predates this code or the analysis
+fabricated this detail; either way it's not an issue in the current implementation.
+
+**Claim confirmed real — this is Bug A:** an `/issue-reasons`-style endpoint
+(`GetIssueReasonsByFabUseCaseImpl`, backed by `DependencyInjection.fetchAllowGroup`, a `@Value`
+field read once and passed unchanged into the use-case's constructor) is structurally identical
+to the `fetchGroup`/`GetFabImpl` shape Phase 2 was built for. The user confirmed the *latest*
+commit (including Phase 2, `61ef5772`) was what was actually tested, ruling out a stale jar as the
+explanation — meaning the scanner itself had a real gap. Re-reading `findOneHopCopies()` with that
+constraint found it: it grouped candidate targets by `Type.getInternalName(entry.getValue()
+.getClass())` (the bean's *runtime* class) and read bytecode via `targetEntry.getValue().getClass()`
+directly — both silently broken for any AOP-advised target bean (common in a real app,
+`@Transactional`/`@Cacheable`/`@Async`/`@Aspect`-matched; never exercised by the demo app, which
+had none of those). This is Bug A, described in full above (including the second, deeper layer —
+instance-level field-storage sharing — found only once the class-level fix alone still didn't make
+the equivalent demo fixture pass).
+
+**Claim confirmed real and independent of Bug A — this is Bug B:** a `/kla-qtime-hours`-style
+endpoint (`GetKlaQTimeHoursUseCaseImpl`, backed by `KlaProperties.qtimeHourList()` — a **record
+accessor method call**, not a field read, on a `KlaProperties` parameter injected directly into a
+`@Bean` factory method) is a genuinely new, unaddressed gap. Verified directly against
+`OneHopFieldCopyScanner`'s own code and doc comment: `PassthroughDetector` only recognized
+`GETFIELD` as an atomic source push (`this.field`); any other method call mid-argument-list,
+including a record accessor, hit `aborted = true` in `visitMethodInsn` — the class's own Javadoc
+listed "a record-accessor source" explicitly as something that "fails open." Described in full
+above as Bug B.
+
 ## What's *not* changed
 
 No existing instrumentation module, no existing shared runtime class (`MockUtils`, `ContextManager`,
