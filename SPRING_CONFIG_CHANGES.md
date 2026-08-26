@@ -1,4 +1,4 @@
-# Spring Configuration Record/Replay — Code Changes
+    # Spring Configuration Record/Replay — Code Changes
 
 Implements record/replay of Spring configuration (dynamic `Environment` reads, `@Value` fields,
 and `@ConfigurationProperties` beans), so that when traffic recorded in one production
@@ -275,6 +275,252 @@ accessor method call**, not a field read, on a `KlaProperties` parameter injecte
 including a record accessor, hit `aborted = true` in `visitMethodInsn` — the class's own Javadoc
 listed "a record-accessor source" explicitly as something that "fails open." Described in full
 above as Bug B.
+
+## Investigation: real-app testing after Phase 3, round 2 (2026-08-26, not yet fixed)
+
+Ran the pushed Phase 3 agent (`cc8324f9`) against the real app again; several issues found. As
+before, the user's own log access is on a different machine, so evidence came as 14 photos of
+another AI's analysis document, reviewed here and checked claim-by-claim against this repo's
+actual source rather than trusted at face value.
+
+**Disregarded — not applicable to this codebase:** the document's root-cause section claims
+`SpringBeanConfigExtractor.setFieldValue()` attempts two fallback mechanisms
+(`Unsafe.objectFieldOffset()`, then `sun.reflect.ReflectionFactory.newFieldAccessor()`) to force
+final-field writes on record components, both blocked on JDK 17, citing specific method names
+(`setFinalField`, `setFinalFieldUnsafe`, `setFinalFieldReflectionFactory`) and line numbers. None
+of this exists anywhere in this codebase — confirmed by grep, same as the previous round's
+"Unsafe" claim. The user confirmed separately that this fallback code was likely added downstream,
+after this repo's commits, in their own deployment — not something to reconcile against here.
+
+**Correction on re-review — one warning in that same log excerpt is real, and points to a genuine
+gap this repo does have.** The three-warning sequence for `KlaProperties.qtimeHourList` has one
+line *before* the two disregarded fallback attempts:
+
+```
+WARN io.arex.inst.runtime.log.LogManager - [[title=arex.spring.bean.config.field.write]]
+java.lang.IllegalAccessException: Can not set final java.lang.String field
+  com.tsmc.lotaction.apps.confirm_lot.framework.di.KlaProperties.qtimeHourList
+    at java.base/java.lang.reflect.Field.set(Field.java:799)
+    at io.arex.inst.config.spring.SpringBeanConfigExtractor.setFieldValue(SpringBeanConfigExtractor.java:246)
+    at io.arex.inst.config.spring.SpringBeanConfigExtractor.applyReplayOverrides(SpringBeanConfigExtractor.java:112)
+```
+
+Log tag `spring.bean.config.field.write`, method `setFieldValue`, exception `IllegalAccessException`
+— an exact match to this repo's actual code (`LogManager.warn("spring.bean.config.field.write", e)`
+inside `setFieldValue()`, called from `applyReplayOverrides()`). Only the *following* two warnings
+(`...write.final.approach1`/`approach2`, via a `setFinalField` method) are from the disregarded
+downstream code — this first one isn't, and it confirms a real, currently-happening gap: the
+record bean's *own* registered fields are always attempted and always fail.
+
+`SpringBeanConfigRegistry.mergeRecordHolderFields()` returns early for the record's own class:
+```java
+if (recordSourcesByType.containsKey(beanClass)) {
+    return fields; // never registers the record's own fields as holders
+}
+```
+`eligibleFields()` still registers the record's own 13 components in `BEAN_FIELDS` (the class is
+`@ConfigurationProperties`-annotated), but they're never added to `RECORD_HOLDER_FIELDS` — that map
+only ever holds *other* beans' reference fields pointing at the record. So every replay,
+`applyReplayOverrides()` looks up `recordHolderFields().get(componentField)`, gets `null`, falls
+through to the plain scalar path, and `field.set()` throws `IllegalAccessException` — for all 13
+components, every request. That's the literal, confirmed source of "156 warnings" (12 non-primitive
+fields × ~13 requests) — a real number, just not evidence of the fabricated root cause.
+
+This was a known, explicit trade-off from Phase 1, not a new bug: *"a record's own components
+still get registered under its own bean name too (harmless... leaving this path alone costs
+nothing)"* (this file, Phase 1 section). The real-world log evidence shows the "costs nothing" part
+was wrong — it's 13 warnings per replayed request in this app, not free. Whether it's also
+*functionally* harmless depends on whether anything reads the record bean's own registered instance
+directly, rather than through a holder field (handled correctly via reconstruct-and-swap, modulo
+the non-idempotent-compact-constructor gap below) or a one-hop derivation (handled separately) —
+unconfirmed from the photos alone, but the noise is worth fixing regardless.
+
+**Proposed fix** (not yet implemented): when a bean's class is itself a known record source, don't
+register its own component fields in `BEAN_FIELDS` at all (skip `eligibleFields()`'s contribution
+for it, or filter fields whose declaring class matches a record source before merging) — there is
+no valid in-place path for these fields; the only real path is holder-swap, a separate mechanism
+that already runs independently of whether the record's own bean entry has any fields.
+
+**Already handled, not a new finding:** the document's P1 (`SwaggerUiConfigProperties.groupsOrder`,
+a `Direction` enum receiving a recorded `String`) and P2 (a `HashSet<String>` failing Jackson
+polymorphic-type resolution) both throw inside the per-field try/catch Phase 0 already added — so
+they fall back to the live value for *that one field* rather than crashing the request. That's the
+original bug this whole effort started from; Phase 0 contains the blast radius but was never meant
+to make either field correctly replay, and doesn't.
+
+**The document contradicts itself — the narrower, evidence-backed claim wins:** an early section
+claims *all 13* `KlaProperties` fields fail on every replay (156 warnings). A later section, backed
+by actual recorded MongoDB data cross-referenced across two separate recordings, shows
+`kla-qtime-hours` replays correctly — `getKlaQTimeHoursUseCase.klaQTimeHourListConfig` is present
+and correctly applied, consistent with Phase 1-3 actually working for that endpoint. The narrower
+claim is the reliable one; the broad "all fields fail" framing is disproven by the document's own
+evidence.
+
+### Confirmed, reproduced live: null-value recording gap
+
+`confirmLotOrderService.reasonAllowGroupForFab` is never recorded in any of the checked recordings
+because it's `null` at record time. Verified directly in this repo's actual source:
+
+- `SpringBeanConfigExtractor.captureAndRecord()` (line ~193): `if (value == null) { continue; }` —
+  a null field gets no recorded entry at all.
+- `SpringBeanConfigExtractor.applyReplayOverrides()` (line ~90): `if (raw == null) { continue; }` —
+  "no recorded entry" and "recorded as null" are indistinguishable; both leave the field untouched,
+  falling back to whatever the *replay host's own local config* produces.
+
+Reproduced live in `arex-spring-config-demo`: added `OptionalGroupController`
+(`@Value("${demo.optional-group:#{null}}")`, genuinely null when unset, matching the real field's
+shape rather than an empty string). Recorded a case with the field null, restarted with
+`--demo.optional-group=LEAKED-LOCAL-VALUE`, replayed the same case: response returned
+`"LEAKED-LOCAL-VALUE"` instead of the actually-recorded `null`.
+
+**Proposed fix** (not yet implemented): record a sentinel marker (e.g. `"__AREX_NULL__"`) instead
+of skipping a null value in `captureAndRecord()`; in `applyReplayOverrides()`, treat that marker as
+an explicit instruction to set the field to `null`, while a genuinely-absent map entry still fails
+open exactly as today. The same skip exists in `RecordConfigSource.serializeComponents()`/
+`reconstruct()` for individual record components, though `KlaProperties`'s own compact constructor
+already defaults its list components away from null, so that path may not be live for this app.
+
+### Confirmed via investigation, not yet reproduced live: enum round-trip gap
+
+Traced P1 (the `Direction` enum) to its real root cause, independent of the disregarded
+Unsafe/ReflectionFactory narrative: the shared `JacksonSerializerWithType`
+(`arex-instrumentation-foundation`) configures Jackson with
+`activateDefaultTyping(validator, DefaultTyping.NON_FINAL)`. A plain Java enum (no per-constant
+class bodies) compiles to a `final` class, so `NON_FINAL` typing never wraps it with type info —
+it serializes as a bare name string. Since `Serializer.deserializeWithType()` always deserializes
+into `Object.class` with no type hint, that string round-trips back as a `java.lang.String`, not
+the enum — confirmed by compiling and running the actual serializer against a test enum
+(`ENUM BACK TYPE: class java.lang.String`). This is a shared, agent-wide serializer limitation
+(no enum-aware handling anywhere in that class), not specific to Spring config.
+
+**Proposed fix** (not yet implemented): fix locally in `SpringBeanConfigExtractor`, not in the
+shared serializer — it already has the field's real declared type via reflection at both record
+and replay time. For an enum-typed field specifically: serialize with plain `Serializer.serialize
+(value)` (no wrapper needed) and deserialize with `Serializer.deserialize(raw, field.getType())` —
+an explicitly-typed overload already used elsewhere in this same file (record component overrides)
+— bypassing the generic serializer's blind-`Object.class` limitation for just this field shape.
+
+**Unconfirmed, not reproduced:** P2's `HashSet<String>` `InvalidTypeIdException` claim. Ran the
+identical shape (`HashSet` of `"A","B","C","D"`) through the actual serializer: it round-tripped
+correctly with a proper type wrapper. No `HashSet`-vs-`ArrayList`-specific code path exists
+anywhere in the serializer. Given this document already contained fabricated and overstated claims
+elsewhere, this one is set aside rather than chased without something concrete to reproduce.
+
+### Confirmed via code reading, not yet reproduced live: non-idempotent compact constructor breaks reconstruct-and-swap
+
+Re-reading the real `KlaProperties` app code (not just its truncated summary) surfaced a case
+Phase 1's design never accounted for. Its compact constructor does more than null-coalescing
+defaults for most components — for one component specifically:
+
+```java
+scanOpeQTimeTypeOrder = scanOpeQTimeTypeOrder.stream()
+        .filter(item -> item != null && item.split(":").length >= 2)
+        .sorted(Comparator.comparingInt(KlaProperties::extractSortKey))
+        .map(item -> item.split(":")[0])
+        .toList();
+```
+
+This is a **one-way, non-idempotent transform**: it expects raw `"key:sortvalue"`-shaped input and
+maps it down to just `key`, discarding the sort value entirely. `RecordConfigSource
+.serializeComponents()` captures each component via its *accessor* — for this component, the
+already-transformed, colon-free output. `RecordConfigSource.reconstruct()` then passes that
+recorded value back in as a constructor argument during replay. Java gives no way to invoke a
+record's canonical constructor without also running its compact constructor — confirmed
+unavoidable, not just inconvenient: `Unsafe.objectFieldOffset()` is unconditionally blocked for
+*any* record field access on JDK 17+ (per the confirmed root cause of the original record bug),
+so there is no field-poking route around the constructor either. The transform runs a second time
+on data that no longer has colons: every item fails `item.split(":").length >= 2`, the filter
+drops everything, and `scanOpeQTimeTypeOrder` reconstructs as an **empty list**.
+
+This is a real gap in the reconstruct-and-swap design itself, not a missing null-check: it
+implicitly assumes a record's compact constructor is idempotent (safe to re-run on its own
+accessor output), which holds for simple defaulting logic (this component's siblings, and the
+demo app's own `KProperties` fixture) but not for a one-way filter/sort/map like this one.
+
+**No clean fix identified.** The only architecturally-correct approach found so far is to stop
+capturing accessor *output* and instead capture the raw, pre-binding property values, then
+reconstruct by re-running Spring Boot's own constructor-binding
+(`org.springframework.boot.context.properties.bind.Binder`) against those raw values, so the
+compact constructor runs exactly once — same as at original startup. That's a substantially larger
+change than anything built so far for this feature; not started, pending direction on how deep to
+take it. Not yet reproduced live (would need a demo fixture with the same filter/sort/map shape).
+
+## Phase 4 — null marker, enum round-trip, dead record-field registration
+
+Fixes Bugs 1-3 from the round-2 investigation above. Bug 4 (non-idempotent compact constructors)
+is left out of scope — no clean fix identified yet, needs its own conversation.
+
+**Reproduced live before fixing**, matching this feature's established discipline:
+
+- **Bug 2 (enum)**: added `SortDirectionController` (`@Value("${demo.sort-direction}") private
+  SortDirection sortDirection;`, `SortDirection` a plain two-constant enum, matching
+  `BusinessHoursController`'s direct-field-read style). Recorded `ASC`, restarted with local
+  `DESC`, replayed: response showed `"DESC"` (the local value), not the recorded `"ASC"`.
+- **Bug 3 (dead record-field registration)**: not observable via HTTP response, since the holder
+  swap already masks it from `/api/k-properties`'s output — that's the whole problem, it's dead
+  code, not a response-visible symptom. Confirmed instead with a characterization test
+  (`SpringBeanConfigRegistryTest`): before the fix, a record source bean's own name *was* present
+  in `beanInstances()`/`beanFields()` after `scan()` — later inverted into the fix's regression
+  test (below).
+
+**Fix 1 — null marker for genuinely-null field values.** File: `SpringBeanConfigExtractor.java`.
+Scoped to the plain (non-record-holder) field path — a record holder field being null itself
+(not one of its components) is a separate, unevidenced case, left alone. New constant
+`NULL_MARKER = "__AREX_NULL__"`. `captureAndRecord()`: when a non-holder field's live value is
+`null`, writes `NULL_MARKER` instead of skipping the entry. `applyReplayOverrides()`: when the
+recorded value equals `NULL_MARKER`, sets the field to `null` explicitly instead of skipping. A
+genuinely-absent map entry still fails open exactly as before.
+
+**Fix 2 — enum-aware serialize/deserialize.** Same file, same two methods, using the field's own
+reflected type (already available at both call sites) instead of the shared serializer's blind
+`Object.class` target. `captureAndRecord()`: for a non-holder, enum-typed field
+(`field.getType().isEnum()`), uses `Serializer.serialize(value)` instead of
+`Serializer.serializeWithType(value)`. `applyReplayOverrides()`: for the same case, uses
+`Serializer.deserialize(raw, field.getType())` (an already-used typed overload,
+`Serializer.java:160`) instead of `Serializer.deserializeWithType(raw)`. Both methods already
+branched on `isRecordHolder`; this is one more `else if` in the same place, not a restructure.
+
+**Fix 3 — stop registering a record source's own fields.** File: `SpringBeanConfigRegistry.java`.
+`scan()`'s per-bean loop now skips a bean entirely when its class is itself a known record source
+(`recordSourcesByType.containsKey(beanClass)`) — there is no in-place update path for these
+fields; only holder-swap applies, and that's a separate, already-independent mechanism.
+`mergeRecordHolderFields()`'s own early-return for this same case is now dead code for this call
+site but was left as-is (harmless, still used for every other bean). `OneHopFieldCopyScanner` is
+unaffected — it receives the full `applicationBeans` map directly from `scan()`, not the filtered
+`BEAN_INSTANCES`.
+
+| File | Change |
+|---|---|
+| `SpringBeanConfigExtractor.java` | New `NULL_MARKER` constant; `captureAndRecord()`/`applyReplayOverrides()` each gain a null-marker branch and an enum branch alongside the existing record-holder branch. |
+| `SpringBeanConfigRegistry.java` | `scan()`'s per-bean loop skips beans whose class is a known record source. |
+
+**Tests:** new `SpringBeanConfigExtractorTest.java` (no such file existed before) — null-field and
+enum-field round-trips (record + replay + restore), plus regression coverage for existing
+non-null/non-enum fields and the fail-open no-recorded-entry case. `ContextManager`/`MockUtils`/
+`Serializer` mocked with simple, naive stand-ins, same convention as `RecordConfigSourceTest` (not
+the real Jackson wiring — these tests are about this class's own branching). Confirmed genuine
+(not vacuous): temporarily changed `NULL_MARKER`'s value and reran — the two null-marker tests
+failed exactly as expected, then reverted. `SpringBeanConfigRegistryTest.java`'s characterization
+test was inverted into `initialize_doesNotRegisterRecordSourceOwnFields`.
+
+**Verified live** against `arex-spring-config-demo`: recorded all of `/api/optional-group`,
+`/api/sort-direction`, `/api/k-properties`, `/api/fetch-group`, `/api/fetch-group-proxied`,
+`/api/time-hours` at one local config, restarted with every one of those values changed locally
+(including a leaked-value string for the null field and a flipped enum constant), replayed all
+six — both directly (`arex-record-id` header) and via the actual `createPlan` webhook (plan
+`6a8ee2bcb0fb652e03468719`, zero `failCases`). All three fixes confirmed working
+(`/api/optional-group` correctly replayed `null` instead of the leaked local string;
+`/api/sort-direction` correctly replayed `"ASC"` instead of local `"DESC"`), zero regression to
+the four pre-existing endpoints.
+
+Also verified at scale under genuine concurrent, multi-environment replay, same methodology as
+Phase 3: recorded 15 distinct environments across all six endpoints (90 cases total, 15 per
+endpoint), alternating `/api/optional-group` between null and a distinct non-null value per
+environment and `/api/sort-direction` between `ASC`/`DESC`, so both branches of both new fixes were
+exercised under real concurrency, not just their happy path. Fired all 90 cases concurrently against
+a single replay-target instance running a 16th, entirely distinct local config. Result: 90/90
+passed, zero cross-contamination between environments, zero leakage of the replay target's local
+config into any response.
 
 ## What's *not* changed
 

@@ -97,6 +97,14 @@ public class SpringBeanConfigRegistry {
         for (Map.Entry<String, Object> entry : applicationBeans.entrySet()) {
             String beanName = entry.getKey();
             Class<?> beanClass = entry.getValue().getClass();
+            if (recordSourcesByType.containsKey(beanClass)) {
+                // A record's own component fields can never be updated in place - Field.set()
+                // rejects them even with setAccessible(true) - only a holder bean's reference
+                // field can be swapped (see RecordConfigSource). Registering them anyway meant
+                // every one was attempted and failed on every replay: confirmed in a real app's
+                // log as a IllegalAccessException per component, every request.
+                continue;
+            }
             List<Field> fields = eligibleFields(beanClass);
             if (!recordSourcesByType.isEmpty()) {
                 fields = mergeRecordHolderFields(beanClass, fields, recordSourcesByType);

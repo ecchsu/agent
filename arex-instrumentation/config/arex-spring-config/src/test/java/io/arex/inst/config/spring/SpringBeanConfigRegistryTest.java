@@ -94,6 +94,29 @@ class SpringBeanConfigRegistryTest {
         assertTrue(SpringBeanConfigRegistry.recordHolderFields().isEmpty());
     }
 
+    /**
+     * Before this fix, a record source's own component fields got registered in BEAN_FIELDS via
+     * eligibleFields() (the class is @ConfigurationProperties-annotated) but were never added to
+     * RECORD_HOLDER_FIELDS - only a *holder* bean's reference field is. So on every replay,
+     * applyReplayOverrides() found no record-holder mapping for these fields, fell through to the
+     * plain scalar path, and field.set() threw IllegalAccessException for every one of them,
+     * every request - confirmed in a real app's log as "arex.spring.bean.config.field.write" /
+     * IllegalAccessException, one per component. There is no in-place update path for these
+     * fields at all - only holder-swap works - so scan() now skips registering the record
+     * source's own bean entirely (see the matching test below for the holder path, still working).
+     */
+    @Test
+    void initialize_doesNotRegisterRecordSourceOwnFields() {
+        FixtureRecordProperties recordSource = new FixtureRecordProperties("hello");
+
+        SpringBeanConfigRegistry.initialize(contextFor(Map.of("recordSource", recordSource)));
+
+        assertTrue(SpringBeanConfigRegistry.beanInstances().isEmpty(),
+                "a record source's own bean entry has no in-place update path and must not be "
+                        + "registered - only a holder bean's reference field can be swapped");
+        assertTrue(SpringBeanConfigRegistry.beanFields().isEmpty());
+    }
+
     @Test
     void initialize_leavesPlainAnnotationBasedRegistrationUnaffected() {
         PlainBean plain = new PlainBean();

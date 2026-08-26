@@ -43,6 +43,17 @@ public class SpringBeanConfigExtractor {
     private static final String AGGREGATE_KEY = "spring-config-properties";
     private static final ConcurrentHashMap<String, ReentrantLock> BEAN_LOCKS = new ConcurrentHashMap<>();
 
+    /**
+     * A field whose live value is null is a real, meaningful recording - not "nothing to
+     * record." Without this, captureAndRecord() would skip the entry entirely, and
+     * applyReplayOverrides() would then be unable to tell "never recorded" apart from "recorded
+     * as null" - both look like a missing map entry, so a genuinely-null field silently falls
+     * back to whatever the *replay host's own local config* produces instead of null. Scoped to
+     * plain (non-record-holder) fields only - a null record-holder reference is a separate,
+     * unevidenced case.
+     */
+    private static final String NULL_MARKER = "__AREX_NULL__";
+
     private SpringBeanConfigExtractor() {
     }
 
@@ -94,18 +105,31 @@ public class SpringBeanConfigExtractor {
                     // deserialization, or a record's final field rejecting reflective mutation
                     // entirely) must not abort replay for every other field/bean in this request.
                     try {
-                        Class<?> recordType = SpringBeanConfigRegistry.recordHolderFields().get(field);
                         Object replayedValue;
-                        if (recordType != null) {
-                            // field holds a reference to a record source, which can't be mutated
-                            // in place - rebuild it and swap the reference instead (see
-                            // RecordConfigSource).
-                            @SuppressWarnings("unchecked")
-                            Map<String, String> componentOverrides = Serializer.deserialize(raw, Map.class);
-                            Object currentRecordInstance = getFieldValue(field, bean);
-                            replayedValue = RecordConfigSource.reconstruct(recordType, currentRecordInstance, componentOverrides);
+                        if (NULL_MARKER.equals(raw)) {
+                            replayedValue = null;
                         } else {
-                            replayedValue = Serializer.deserializeWithType(raw);
+                            Class<?> recordType = SpringBeanConfigRegistry.recordHolderFields().get(field);
+                            if (recordType != null) {
+                                // field holds a reference to a record source, which can't be
+                                // mutated in place - rebuild it and swap the reference instead
+                                // (see RecordConfigSource).
+                                @SuppressWarnings("unchecked")
+                                Map<String, String> componentOverrides = Serializer.deserialize(raw, Map.class);
+                                Object currentRecordInstance = getFieldValue(field, bean);
+                                replayedValue = RecordConfigSource.reconstruct(recordType, currentRecordInstance, componentOverrides);
+                            } else if (field.getType().isEnum()) {
+                                // The shared serializer's default-typing embeds no type info for
+                                // a plain enum (a simple enum with no per-constant class bodies
+                                // compiles to a final class, excluded by DefaultTyping.NON_FINAL)
+                                // - deserializeWithType() would blindly return a String, not the
+                                // enum, since it always targets Object.class. Deserialize
+                                // straight into the field's own known type instead, bypassing
+                                // that gap entirely for this shape.
+                                replayedValue = Serializer.deserialize(raw, field.getType());
+                            } else {
+                                replayedValue = Serializer.deserializeWithType(raw);
+                            }
                         }
                         Object original = getFieldValue(field, bean);
                         setFieldValue(field, bean, replayedValue);
@@ -190,13 +214,24 @@ public class SpringBeanConfigExtractor {
             Object bean = entry.getValue();
             for (Field field : SpringBeanConfigRegistry.beanFields().get(beanName)) {
                 Object value = getFieldValue(field, bean);
+                boolean isRecordHolder = SpringBeanConfigRegistry.recordHolderFields().containsKey(field);
                 if (value == null) {
+                    if (isRecordHolder) {
+                        continue; // record-holder null handling out of scope, unchanged
+                    }
+                    allValues.put(fieldKey(beanName, field), NULL_MARKER);
                     continue;
                 }
-                boolean isRecordHolder = SpringBeanConfigRegistry.recordHolderFields().containsKey(field);
-                String serialized = isRecordHolder
-                        ? RecordConfigSource.serializeComponents(value)
-                        : Serializer.serializeWithType(value);
+                String serialized;
+                if (isRecordHolder) {
+                    serialized = RecordConfigSource.serializeComponents(value);
+                } else if (field.getType().isEnum()) {
+                    // See the matching comment in applyReplayOverrides(): no type wrapper is
+                    // needed here since replay deserializes straight into field.getType().
+                    serialized = Serializer.serialize(value);
+                } else {
+                    serialized = Serializer.serializeWithType(value);
+                }
                 if (serialized == null) {
                     continue;
                 }

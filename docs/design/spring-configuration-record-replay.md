@@ -1035,12 +1035,12 @@ differs from earlier sections of this proposal, and why.
 - **Part A and Part B together**: added a combined endpoint touching both mechanisms in one
   request; confirmed both replay correctly within the same case, not just in isolation.
 
-### 12.4 Further hardening after real-app testing (Phase 0-3)
+### 12.4 Further hardening after real-app testing (Phase 0-4)
 
-Testing against a real target application (not just the demo) surfaced four further gaps in Part
-B, all fixed since the sections above were written. Full file-by-file detail, tests, and live
-verification for each is in `SPRING_CONFIG_CHANGES.md`; summarized here so this proposal's account
-of "what's actually running" stays current:
+Testing against a real target application (not just the demo) surfaced further gaps in Part B, all
+fixed since the sections above were written except one left deliberately open (noted at the end).
+Full file-by-file detail, tests, and live verification for each is in `SPRING_CONFIG_CHANGES.md`;
+summarized here so this proposal's account of "what's actually running" stays current:
 
 - **Phase 0** — a type mismatch on one field (`IllegalArgumentException`) wasn't caught by the
   per-field isolation §12.2 already relies on (only `IllegalAccessException` was), aborting
@@ -1065,11 +1065,34 @@ of "what's actually running" stays current:
   injected directly as a `@Bean` parameter wasn't a recognized source shape at all — extended the
   scanner to recognize it.
 
+- **Phase 4** — three further gaps, again found only via real-app testing: (a) a field whose live
+  value is `null` at record time was skipped entirely, and replay couldn't tell "never recorded"
+  apart from "recorded as null" - both looked like a missing map entry, so the field silently fell
+  back to whatever the *replay host's own local config* produced. Fixed with an explicit null
+  marker written at record time, restoring `null` at replay time. (b) A plain enum field round-
+  tripped as a `String`, not the enum: the shared serializer's default typing embeds no type info
+  for a class it treats as `final` (every plain enum with no per-constant class bodies), and its
+  blind `Object.class` deserialize target has no way to recover the intended type. Fixed locally,
+  using the field's own reflected type (already available) instead of touching the shared
+  serializer. (c) A record source's own component fields were registered for replay even though no
+  in-place update path exists for them (only a holder's reference field can be swapped) - every one
+  was attempted and failed, every request. Fixed by no longer registering them at all.
+
 Each was found and fixed via live reproduction against `arex-spring-config-demo` (extended with
-matching fixtures for Phase 3's two gaps), then confirmed via the real `arex-schedule` webhook,
-including under genuine concurrent, multi-environment replay (20 distinct environments, 80 cases,
-fired concurrently against one shared replay target, zero cross-contamination) — same verification
-discipline as §12.3.
+matching fixtures for Phase 3's two gaps and Phase 4's null/enum gaps), then confirmed via the real
+`arex-schedule` webhook, including under genuine concurrent, multi-environment replay (20 distinct
+environments, 80 cases, fired concurrently against one shared replay target, zero
+cross-contamination) — same verification discipline as §12.3.
+
+One further gap, found alongside Phase 4's three but with no clean fix identified, is deliberately
+left unaddressed: a record whose compact constructor performs a one-way, non-idempotent transform
+on one of its own components (filtering/sorting/mapping raw input down to something smaller) gets
+that transform silently re-applied during reconstruct-and-swap, since Java gives no way to invoke a
+record's canonical constructor without also running its compact constructor. The only
+architecturally-correct fix identified - capturing raw pre-binding property values and reconstructing
+via Spring Boot's own constructor-binding `Binder` instead of from accessor output - is
+substantially larger than anything built for this feature so far. See `SPRING_CONFIG_CHANGES.md`
+for the full writeup.
 
 ## 13. Debugging: tracing a request through the logs
 
