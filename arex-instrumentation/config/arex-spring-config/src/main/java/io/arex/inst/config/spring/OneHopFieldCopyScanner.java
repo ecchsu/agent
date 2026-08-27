@@ -14,8 +14,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.RecordComponent;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -297,6 +299,17 @@ final class OneHopFieldCopyScanner {
      * expression entirely, never partially - by any non-atomic argument (a method call other
      * than the matching constructor invocation itself, an array/arithmetic op, etc).
      *
+     * <p>A sibling argument can itself be a {@code new Wrapper(...)} construction - e.g.
+     * {@code new Target(new Wrapper(gateway), sourceField)} - without disqualifying the source
+     * field's own passthrough in another argument position: each nested {@code new X(...)} gets
+     * its own {@link Frame} on a small stack, and a nested construction that completes cleanly
+     * (no branch, no non-atomic argument of its own) collapses into one atomic argument for the
+     * frame below when its constructor call closes - exactly like a bare {@code ALOAD}/{@code LDC}
+     * would. A nested construction that *isn't* clean poisons the frame below the same way any
+     * other non-atomic argument does, so the whole outer call still fails open. This is still
+     * bounded, straight-line analysis, not a general dataflow one - it just no longer conflates
+     * "a wrapper object is one of the arguments" with "the argument list can't be trusted at all."
+     *
      * <p>A branch anywhere in the method disqualifies every match found in it, not just ones
      * textually inside the branch: an if/else could construct the same target type differently
      * in each arm, so "this call site looks like a clean passthrough" isn't trustworthy unless
@@ -311,13 +324,22 @@ final class OneHopFieldCopyScanner {
         private final List<ConstructorCallSite> localFound = new ArrayList<>();
         private boolean methodHasBranch;
 
+        /** One in-progress {@code new X(...)} argument list - one per nesting level. */
+        private static final class Frame {
+            final String newType;
+            int argCount;
+            boolean sawSource;
+            int sourceArgPosition = -1;
+            boolean aborted;
+            int pendingObjectRefSlot = -1;
+
+            Frame(String newType) {
+                this.newType = newType;
+            }
+        }
+
+        private final Deque<Frame> frames = new ArrayDeque<>();
         private String pendingNewType;
-        private boolean collectingArgs;
-        private int argCount;
-        private boolean sawSource;
-        private int sourceArgPosition = -1;
-        private boolean aborted;
-        private int pendingObjectRefSlot = -1;
 
         PassthroughDetector(String sourceOwnerInternalName, String sourceFieldName, List<ConstructorCallSite> found) {
             super(Opcodes.ASM9);
@@ -333,160 +355,167 @@ final class OneHopFieldCopyScanner {
             }
         }
 
-        private void flushPendingLoad() {
-            if (pendingObjectRefSlot != -1) {
-                argCount++; // a bare object reference load, never followed by GETFIELD - its own atomic argument
-                pendingObjectRefSlot = -1;
+        private void flushPendingLoad(Frame frame) {
+            if (frame.pendingObjectRefSlot != -1) {
+                frame.argCount++; // a bare object reference load, never followed by GETFIELD - its own atomic argument
+                frame.pendingObjectRefSlot = -1;
             }
-        }
-
-        private void reset() {
-            pendingNewType = null;
-            collectingArgs = false;
-            argCount = 0;
-            sawSource = false;
-            sourceArgPosition = -1;
-            aborted = false;
-            pendingObjectRefSlot = -1;
         }
 
         @Override
         public void visitTypeInsn(int opcode, String type) {
             if (opcode != Opcodes.NEW) {
-                if (collectingArgs) {
-                    flushPendingLoad();
-                    aborted = true; // e.g. CHECKCAST/ANEWARRAY/INSTANCEOF mid-argument-list
+                Frame top = frames.peek();
+                if (top != null) {
+                    flushPendingLoad(top);
+                    top.aborted = true; // e.g. CHECKCAST/ANEWARRAY/INSTANCEOF mid-argument-list
                 }
                 return;
             }
-            if (collectingArgs) {
-                flushPendingLoad();
-                aborted = true; // a nested "new" while already collecting an outer call's args
-                return;
-            }
+            // NEW is always immediately followed by its matching DUP in compiler-generated
+            // bytecode, whether this is the outermost call or a nested one used as one argument
+            // of an already-in-progress outer call - at most one NEW can be awaiting its DUP at
+            // a time even when nested, so a single field (not a stack) is enough here.
             pendingNewType = type;
         }
 
         @Override
         public void visitInsn(int opcode) {
-            if (opcode == Opcodes.DUP && pendingNewType != null && !collectingArgs) {
-                collectingArgs = true;
-                argCount = 0;
-                sawSource = false;
-                sourceArgPosition = -1;
-                aborted = false;
-                pendingObjectRefSlot = -1;
+            if (opcode == Opcodes.DUP && pendingNewType != null) {
+                frames.push(new Frame(pendingNewType));
+                pendingNewType = null;
                 return;
             }
-            if (!collectingArgs) {
+            Frame top = frames.peek();
+            if (top == null) {
                 return;
             }
-            flushPendingLoad();
-            if (aborted) {
+            flushPendingLoad(top);
+            if (top.aborted) {
                 return;
             }
             if (ATOMIC_ZERO_OPERAND_PUSHES.contains(opcode)) {
-                argCount++;
+                top.argCount++;
             } else {
-                aborted = true;
+                top.aborted = true;
             }
         }
 
         @Override
         public void visitVarInsn(int opcode, int var) {
-            if (!collectingArgs) {
+            Frame top = frames.peek();
+            if (top == null) {
                 return;
             }
-            flushPendingLoad();
-            if (aborted) {
+            flushPendingLoad(top);
+            if (top.aborted) {
                 return;
             }
             if (opcode == Opcodes.ALOAD) {
-                pendingObjectRefSlot = var; // might be immediately consumed by a following GETFIELD
+                top.pendingObjectRefSlot = var; // might be immediately consumed by a following GETFIELD
             } else if (opcode >= Opcodes.ILOAD && opcode < Opcodes.ALOAD) {
-                argCount++; // ILOAD/LLOAD/FLOAD/DLOAD of a primitive local
+                top.argCount++; // ILOAD/LLOAD/FLOAD/DLOAD of a primitive local
             } else {
-                aborted = true; // a STORE mid-argument-list - not straight-line enough
+                top.aborted = true; // a STORE mid-argument-list - not straight-line enough
             }
         }
 
         @Override
         public void visitFieldInsn(int opcode, String owner, String name, String descriptor) {
-            if (!collectingArgs) {
+            Frame top = frames.peek();
+            if (top == null) {
                 return;
             }
-            if (opcode == Opcodes.GETFIELD && pendingObjectRefSlot != -1) {
-                pendingObjectRefSlot = -1;
-                if (!aborted) {
+            if (opcode == Opcodes.GETFIELD && top.pendingObjectRefSlot != -1) {
+                top.pendingObjectRefSlot = -1;
+                if (!top.aborted) {
                     if (owner.equals(sourceOwnerInternalName) && name.equals(sourceFieldName)) {
-                        sawSource = true;
-                        sourceArgPosition = argCount;
+                        top.sawSource = true;
+                        top.sourceArgPosition = top.argCount;
                     }
-                    argCount++;
+                    top.argCount++;
                 }
                 return;
             }
-            flushPendingLoad();
-            if (aborted) {
+            flushPendingLoad(top);
+            if (top.aborted) {
                 return;
             }
             if (opcode == Opcodes.GETSTATIC) {
-                argCount++;
+                top.argCount++;
             } else {
-                aborted = true; // PUTFIELD/PUTSTATIC/GETFIELD-without-a-pending-ref mid-argument-list
+                top.aborted = true; // PUTFIELD/PUTSTATIC/GETFIELD-without-a-pending-ref mid-argument-list
             }
         }
 
         @Override
         public void visitLdcInsn(Object value) {
-            if (!collectingArgs) {
+            Frame top = frames.peek();
+            if (top == null) {
                 return;
             }
-            flushPendingLoad();
-            if (!aborted) {
-                argCount++;
+            flushPendingLoad(top);
+            if (!top.aborted) {
+                top.argCount++;
             }
         }
 
         @Override
         public void visitIntInsn(int opcode, int operand) {
-            if (!collectingArgs) {
+            Frame top = frames.peek();
+            if (top == null) {
                 return;
             }
-            flushPendingLoad();
-            if (aborted) {
+            flushPendingLoad(top);
+            if (top.aborted) {
                 return;
             }
             if (opcode == Opcodes.BIPUSH || opcode == Opcodes.SIPUSH) {
-                argCount++;
+                top.argCount++;
             } else {
-                aborted = true; // NEWARRAY
+                top.aborted = true; // NEWARRAY
             }
         }
 
         @Override
         public void visitMethodInsn(int opcode, String owner, String name, String descriptor, boolean isInterface) {
-            if (!collectingArgs) {
+            Frame top = frames.peek();
+            if (top == null) {
                 return;
             }
-            if (opcode == Opcodes.INVOKESPECIAL && "<init>".equals(name) && owner.equals(pendingNewType)) {
-                flushPendingLoad();
-                if (!aborted && sawSource) {
-                    localFound.add(new ConstructorCallSite(owner, descriptor, sourceArgPosition));
+            if (opcode == Opcodes.INVOKESPECIAL && "<init>".equals(name) && owner.equals(top.newType)) {
+                flushPendingLoad(top);
+                frames.pop();
+                Frame parent = frames.peek();
+                if (parent == null) {
+                    // the outermost constructor call just closed - a completed candidate match
+                    if (!top.aborted && top.sawSource) {
+                        localFound.add(new ConstructorCallSite(owner, descriptor, top.sourceArgPosition));
+                    }
+                } else if (top.aborted) {
+                    parent.aborted = true; // a non-atomic nested construction poisons the outer argument list
+                } else {
+                    // a clean, self-contained nested construction is one atomic argument for
+                    // the outer call - propagate a source read found inside it, if any.
+                    if (top.sawSource) {
+                        parent.sawSource = true;
+                        parent.sourceArgPosition = parent.argCount;
+                    }
+                    parent.argCount++;
                 }
-                reset();
                 return;
             }
-            flushPendingLoad();
-            aborted = true; // any other method call used to compute an argument
+            flushPendingLoad(top);
+            top.aborted = true; // any other method call used to compute an argument
         }
 
         @Override
         public void visitJumpInsn(int opcode, Label label) {
             methodHasBranch = true;
-            if (collectingArgs) {
-                flushPendingLoad();
-                aborted = true;
+            Frame top = frames.peek();
+            if (top != null) {
+                flushPendingLoad(top);
+                top.aborted = true;
             }
         }
 

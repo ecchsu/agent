@@ -402,4 +402,101 @@ class OneHopFieldCopyScannerTest {
 
         assertTrue(result.isEmpty(), "a two-hop this.holderField.accessor() chain is out of scope and must not match");
     }
+
+    // ---- positive fixture: a sibling argument is itself a nested "new Wrapper(...)" construction ----
+    // matches the real app's `new Target(new Gateways(gateway), fetchAllowGroup)` shape.
+
+    static class NestedSource {
+        private final String fetchGroup;
+
+        NestedSource(String fetchGroup) {
+            this.fetchGroup = fetchGroup;
+        }
+
+        NestedTarget makeTarget(Gateway gateway) {
+            return new NestedTarget(new Wrapper(gateway), fetchGroup);
+        }
+    }
+
+    static class Wrapper {
+        private final Gateway gateway;
+
+        Wrapper(Gateway gateway) {
+            this.gateway = gateway;
+        }
+    }
+
+    static class NestedTarget {
+        private final Wrapper wrapper;
+        private final String fetchGroup;
+
+        NestedTarget(Wrapper wrapper, String fetchGroup) {
+            this.wrapper = wrapper;
+            this.fetchGroup = fetchGroup;
+        }
+    }
+
+    @Test
+    void findOneHopCopies_detectsPassthroughWhenSiblingArgumentIsANestedConstructorCall() throws Exception {
+        NestedSource source = new NestedSource("team-a");
+        Gateway gateway = new Gateway();
+        NestedTarget target = source.makeTarget(gateway);
+
+        Map<String, Object> applicationBeans = beans("source", source, "target", target);
+        Field sourceField = NestedSource.class.getDeclaredField("fetchGroup");
+
+        Map<String, List<Field>> result = OneHopFieldCopyScanner.findOneHopCopies(
+                applicationBeans, sourceFields("source", sourceField), Collections.emptyMap(), Collections.emptySet());
+
+        assertTrue(result.containsKey("target"),
+                "a nested constructor call for a sibling argument must not block detection of the source field's own passthrough");
+        assertEquals("fetchGroup", result.get("target").get(0).getName());
+    }
+
+    // ---- negative fixture: the nested constructor's own argument isn't atomic (a method call) ----
+
+    static class DirtyWrapper {
+        private final String value;
+
+        DirtyWrapper(String value) {
+            this.value = value;
+        }
+    }
+
+    static class DirtyNestedSource {
+        private final String fetchGroup;
+
+        DirtyNestedSource(String fetchGroup) {
+            this.fetchGroup = fetchGroup;
+        }
+
+        DirtyNestedTarget makeTarget() {
+            return new DirtyNestedTarget(new DirtyWrapper(String.valueOf(42)), fetchGroup);
+        }
+    }
+
+    static class DirtyNestedTarget {
+        private final DirtyWrapper wrapper;
+        private final String fetchGroup;
+
+        DirtyNestedTarget(DirtyWrapper wrapper, String fetchGroup) {
+            this.wrapper = wrapper;
+            this.fetchGroup = fetchGroup;
+        }
+    }
+
+    @Test
+    void findOneHopCopies_doesNotMatchWhenNestedConstructorArgumentIsNotAtomic() throws Exception {
+        DirtyNestedSource source = new DirtyNestedSource("team-a");
+        DirtyNestedTarget target = source.makeTarget();
+
+        Map<String, Object> applicationBeans = beans("source", source, "target", target);
+        Field sourceField = DirtyNestedSource.class.getDeclaredField("fetchGroup");
+
+        Map<String, List<Field>> result = OneHopFieldCopyScanner.findOneHopCopies(
+                applicationBeans, sourceFields("source", sourceField), Collections.emptyMap(), Collections.emptySet());
+
+        assertTrue(result.isEmpty(),
+                "a nested constructor call that isn't itself a clean atomic argument must poison the outer match, not just its own slot");
+    }
 }

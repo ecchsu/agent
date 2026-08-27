@@ -522,6 +522,134 @@ a single replay-target instance running a 16th, entirely distinct local config. 
 passed, zero cross-contamination between environments, zero leakage of the replay target's local
 config into any response.
 
+## Investigation: nested-constructor argument breaks one-hop discovery (2027-08-27, not yet fixed)
+
+Ran the pushed Phase 4 agent (`d930e275`) against the real app again; `/api/confirmlot/v2/templates/issue-reasons`
+(backed by `GetIssueReasonsByFabUseCaseImpl.fetchAllowGroup`, the same one-hop passthrough shape
+Phase 2 was built for) still returned unfiltered results. This round's evidence came in three
+stages: an initial analysis, an attempted fix based on it, and a second analysis after that fix
+didn't fully resolve the symptom — all from another AI working against the user's real app (whose
+log the user doesn't have direct access to), reviewed here across 17 photos and checked
+claim-by-claim against this repo's actual source, same discipline as prior rounds.
+
+**Stage 1 claim, determined incorrect:** that `findOneHopCopies()`'s merge step
+(`SpringBeanConfigRegistry.java:127-138`) stores `null` via
+`BEAN_INSTANCES.put(beanName, applicationBeans.get(beanName))`, because
+`GetIssueReasonsByFabUseCaseImpl` (no `@Value`/`@ConfigurationProperties` of its own) was supposedly
+never added to `applicationBeans` in the first collection pass. Traced this directly:
+`groupBeansByRealInternalName()` builds its lookup by iterating `applicationBeans.entrySet()`
+itself, so every bean name that can possibly reach the merge step is *already* a key in
+`applicationBeans` — this lookup cannot return null for a key derived from the same map. The
+attempted fix built on this theory (threading the bean instance directly through
+`OneHopFieldCopyScanner`'s return type instead of doing a separate `applicationBeans.get()` lookup)
+was harmless but didn't address the real gap, which is why the symptom persisted.
+
+**Stage 3 claim, also determined incorrect (self-contradicted by the same investigation's own
+evidence):** that `DependencyInjection` (a `@Configuration` class) might be entirely absent from
+`applicationBeans`/the registry because `beanFactory.containsSingleton("dependencyInjection")`
+could return `false` for a CGLIB-enhanced `@Configuration` proxy. This can't be right:
+`dependencyInjection.fetchAllowGroup` (the *source* field, a different field on the same bean) was
+independently confirmed recorded successfully in this same investigation's own evidence — which is
+only possible if `DependencyInjection` is already in the registry.
+
+**Confirmed real, verified independently against this repo's actual `OneHopFieldCopyScanner`
+source, and corroborated by the investigation's own final analysis:** the real factory method is
+```java
+return new GetIssueReasonsByFabUseCaseImpl(
+    new GetIssueReasonsByFabUseCaseImpl.Gateways(gateway), // nested constructor call
+    fetchAllowGroup                                         // simple field passthrough
+);
+```
+`PassthroughDetector.visitTypeInsn()` aborts the *entire* match the moment it sees a nested `NEW`
+while already collecting an outer call's arguments (`aborted = true`, with this class's own
+existing comment: "a nested 'new' while already collecting an outer call's args") — regardless of
+whether some *other* argument in the same call is a perfectly clean, simple passthrough.
+`fetchAllowGroup` never gets recognized purely because its sibling argument happens to be a wrapped
+object construction. Confirmed this is unavoidable under the current design: the state machine
+tracks exactly one pending `new` at a time (`pendingNewType`), with no way to represent "currently
+inside a nested constructor call that is itself part of an outer one." This is a real, narrower
+version of the same "anything wider than this exact shape fails open" limitation already documented
+for this class - just one specific "wider" shape not previously identified.
+
+A separate, unconfirmed variant surfaced in this round's first analysis stage: `fetchAllowGroup`
+computed via a runtime service call (`fetchAllowGroupService.getFetchAllowGroup(fab, useCase)`)
+wrapped in try/catch, rather than a field. Unlike the nested-constructor finding, this one only
+appears once, isn't cross-referenced against other evidence in the same investigation, and directly
+contradicts the field-based shape shown consistently everywhere else in the same three-stage
+investigation - set aside as unconfirmed, likely a conflation, rather than acted on.
+
+**Reproduced live** in `arex-spring-config-demo`: added `GetIssueReasonsImpl` (with a nested
+`public static class GatewayWrapper`, matching the real app's `Gateways` shape exactly) +
+`DependencyInjection.getIssueReasons(Gateway)` (`return new GetIssueReasonsImpl(new
+GetIssueReasonsImpl.GatewayWrapper(gateway), fetchGroup);`) + `/api/issue-reasons`. Recorded at
+`fetchGroup=team-a`, restarted with local `NESTEDBUG-LOCAL-team`, replayed the recorded case:
+response returned `"NESTEDBUG-LOCAL-team"` (the local value) instead of the recorded `"team-a"` -
+confirming the diagnosis live, independent of any real-app log.
+
+**A broader fix was proposed and considered, then rejected:** replacing (or supplementing) the
+one-hop scanner with a `BeanPostProcessor` that captures every non-static field on every singleton
+bean after Spring finishes constructing it, regardless of annotation or how the field's value was
+computed - sidestepping bytecode analysis (and this specific limitation) entirely. Rejected: this
+is a fundamentally wider net than this feature's deliberate "config only" scope. Phase 1's own
+original design rationale excludes non-config framework state for exactly this reason (payload
+bloat, reflection failures on complex runtime objects) - capturing *every* field on *every* bean
+adds the same risk to *application* beans too, plus a new one specific to replay: overwriting a
+bean's live mutable runtime state (a cache, a connection, a counter) with a stale recorded snapshot
+at replay time has nothing to do with config and could break application behavior in ways this
+feature has never previously risked. A narrower fix - teaching the existing scanner to treat one
+level of self-contained nested construction as a single atomic argument, rather than aborting
+outright - stays within the class's existing straight-line-only philosophy without expanding scope.
+
+## Phase 5 - handle a self-contained nested constructor call as one atomic argument
+
+Fixes the nested-constructor gap above. `PassthroughDetector`'s per-call tracking state (previously
+a flat set of fields: `pendingNewType`, `collectingArgs`, `argCount`, `sawSource`,
+`sourceArgPosition`, `aborted`, `pendingObjectRefSlot`) became a `Frame` on a small `Deque<Frame>`
+stack, one per nesting level. Encountering a nested `NEW` while already collecting an outer call's
+arguments no longer aborts unconditionally - a new frame is pushed for it. When a frame's own
+`INVOKESPECIAL <init>` closes it:
+
+- If it's the outermost call (no parent frame left), this is a completed candidate match, exactly
+  as before.
+- If the frame is *not* aborted and a parent frame exists, the whole nested construction collapses
+  into one atomic argument for the parent - exactly like a bare `ALOAD`/`LDC` would - and a source
+  read found inside the nested call (unevidenced, but free to support given the design) propagates
+  to the parent too.
+- If the frame *is* aborted (another `NEW` inside it, a branch, a non-`<init>` method call), the
+  parent frame is poisoned the same way any other non-atomic argument would poison it - the whole
+  outer match still fails open, no wider than what's already evidenced.
+
+`DirectAssignmentDetector` (the target-constructor side) is unaffected - it already only cares about
+the tracked parameter slot, not how the caller assembled it.
+
+| File | Change |
+|---|---|
+| `OneHopFieldCopyScanner.java` | `PassthroughDetector` restructured around a `Frame`/`Deque<Frame>` stack instead of flat per-call fields; every `visit*` method now operates on `frames.peek()`. |
+
+**Tests:** `OneHopFieldCopyScannerTest.java` gained a positive case (a sibling argument is itself a
+`new Wrapper(gateway)` construction, matching the real app's shape exactly) and a negative case (the
+nested constructor's own argument is computed via a method call, not atomic - confirms poisoning
+propagates to the outer frame rather than only failing the nested slot). Confirmed genuine: reverted
+to abort-on-nested-`NEW` and reran - exactly the new positive test failed, nothing else regressed.
+All 32 existing tests (Phase 0-4) still pass unchanged.
+
+**Verified live** against `arex-spring-config-demo`: added `GetIssueReasonsImpl` (with a nested
+`GatewayWrapper`, matching the real app's `Gateways` shape) + `DependencyInjection.getIssueReasons()`
++ `/api/issue-reasons`. Recorded all seven endpoints (this one plus the six from Phase 3/4) at one
+local config, restarted with every value changed locally, replayed all seven - both directly
+(`arex-record-id` header) and via the actual `createPlan` webhook (plan
+`6a90521bb0fb652e034687de`, zero `failCases`). `/api/issue-reasons` now correctly replays the
+recorded value instead of the leaked local one; zero regression to the six pre-existing endpoints.
+
+Also verified at scale under genuine concurrent, multi-environment replay, same methodology as
+Phase 3/4: recorded 15 distinct environments across all seven endpoints (105 cases total, 15 per
+endpoint), alternating `/api/optional-group` between null and a distinct non-null value per
+environment and `/api/sort-direction` between `ASC`/`DESC`. Fired all 105 cases concurrently against
+a single replay-target instance running a 16th, entirely distinct local config. Result: 105/105
+passed, zero cross-contamination between environments, zero leakage of the replay target's local
+config into any response - `/api/issue-reasons` (the new Phase 5 fixture) held up under real
+concurrency exactly like the six pre-existing endpoints.
+
 ## What's *not* changed
 
 No existing instrumentation module, no existing shared runtime class (`MockUtils`, `ContextManager`,

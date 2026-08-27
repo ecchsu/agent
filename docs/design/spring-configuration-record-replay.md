@@ -1035,7 +1035,7 @@ differs from earlier sections of this proposal, and why.
 - **Part A and Part B together**: added a combined endpoint touching both mechanisms in one
   request; confirmed both replay correctly within the same case, not just in isolation.
 
-### 12.4 Further hardening after real-app testing (Phase 0-4)
+### 12.4 Further hardening after real-app testing (Phase 0-5)
 
 Testing against a real target application (not just the demo) surfaced further gaps in Part B, all
 fixed since the sections above were written except one left deliberately open (noted at the end).
@@ -1078,8 +1078,23 @@ summarized here so this proposal's account of "what's actually running" stays cu
   in-place update path exists for them (only a holder's reference field can be swapped) - every one
   was attempted and failed, every request. Fixed by no longer registering them at all.
 
+- **Phase 5** — a nested constructor call for one argument silently broke discovery of a *different*
+  argument in the same call: `new Target(new Wrapper(gateway), fetchAllowGroup)` never matched,
+  because the one-hop scanner's bytecode tracker could only follow one pending `new X(...)` at a
+  time and aborted outright on any nested one — even though `fetchAllowGroup` itself was a
+  perfectly clean, simple passthrough with no connection to the nested `Wrapper` construction.
+  Fixed by tracking each nesting level as its own frame on a small stack: a nested construction that
+  is itself clean (no further nesting, no branches, no other method calls) now collapses into one
+  atomic argument for the level below, instead of poisoning the whole call. A broader alternative —
+  replacing the scanner with a `BeanPostProcessor` that captures every field on every bean
+  regardless of annotation or how it was set — was considered and rejected: it would abandon this
+  feature's deliberate "config only" scope (§7.1, §12.2's framework-noise exclusion) in favor of
+  capturing arbitrary application state, risking both payload bloat and, on replay, overwriting live
+  mutable state (a cache, a connection) that has nothing to do with configuration.
+
 Each was found and fixed via live reproduction against `arex-spring-config-demo` (extended with
-matching fixtures for Phase 3's two gaps and Phase 4's null/enum gaps), then confirmed via the real
+matching fixtures for Phase 3's two gaps, Phase 4's null/enum gaps, and Phase 5's nested-constructor
+gap), then confirmed via the real
 `arex-schedule` webhook, including under genuine concurrent, multi-environment replay (20 distinct
 environments, 80 cases, fired concurrently against one shared replay target, zero
 cross-contamination) — same verification discipline as §12.3.
