@@ -5,11 +5,13 @@ import org.joda.time.DateTime;
 import org.joda.time.DateTimeZone;
 
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
+import java.time.Period;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.Calendar;
@@ -65,6 +67,25 @@ public class TimeTestInfo {
     private Timestamp timestamp = new Timestamp(System.currentTimeMillis());
 
     private Instant instant = Instant.now();
+
+    private Duration duration = Duration.ofSeconds(125);
+    private Period period = Period.of(1, 2, 3);
+
+    public Duration getDuration() {
+        return duration;
+    }
+
+    public void setDuration(Duration duration) {
+        this.duration = duration;
+    }
+
+    public Period getPeriod() {
+        return period;
+    }
+
+    public void setPeriod(Period period) {
+        this.period = period;
+    }
 
     private Range range;
 

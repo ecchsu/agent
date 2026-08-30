@@ -10,11 +10,13 @@ import io.arex.foundation.serializer.jackson.adapter.CustomBeanModifier;
 import io.arex.foundation.serializer.jackson.adapter.StringAdapter;
 import io.arex.foundation.serializer.jackson.adapter.CalendarAdapter;
 import io.arex.foundation.serializer.jackson.adapter.DateAdapter;
+import io.arex.foundation.serializer.jackson.adapter.DurationAdapter;
 import io.arex.foundation.serializer.jackson.adapter.InstantAdapter;
 import io.arex.foundation.serializer.jackson.adapter.LocalDateAdapter;
 import io.arex.foundation.serializer.jackson.adapter.LocalDateTimeAdapter;
 import io.arex.foundation.serializer.jackson.adapter.LocalTimeAdapter;
 import io.arex.foundation.serializer.jackson.adapter.OffsetDateTimeAdapter;
+import io.arex.foundation.serializer.jackson.adapter.PeriodAdapter;
 import io.arex.foundation.serializer.jackson.adapter.XMLGregorianCalendarAdapter;
 import io.arex.foundation.serializer.jackson.adapter.ZonedDateTimeAdapter;
 import io.arex.inst.runtime.serializer.StringSerializable;
@@ -22,11 +24,13 @@ import io.arex.inst.runtime.serializer.StringSerializable;
 import javax.xml.datatype.XMLGregorianCalendar;
 import java.lang.reflect.Type;
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
+import java.time.Period;
 import java.time.ZonedDateTime;
 import java.util.Calendar;
 import java.util.Date;
@@ -60,6 +64,8 @@ public class JacksonRequestSerializer implements StringSerializable {
         module.addSerializer(Instant.class, new InstantAdapter.RequestSerializer());
         module.addSerializer(OffsetDateTime.class, new OffsetDateTimeAdapter.RequestSerializer());
         module.addSerializer(ZonedDateTime.class, new ZonedDateTimeAdapter.RequestSerializer());
+        module.addSerializer(Duration.class, new DurationAdapter.Serializer());
+        module.addSerializer(Period.class, new PeriodAdapter.Serializer());
         module.addSerializer(String.class, new StringAdapter.Serializer());
     }
 

@@ -18,6 +18,7 @@ import io.arex.foundation.serializer.gson.adapter.FastUtilAdapterFactory;
 import io.arex.foundation.serializer.jackson.adapter.CalendarAdapter;
 import io.arex.foundation.serializer.jackson.adapter.CustomBeanModifier;
 import io.arex.foundation.serializer.jackson.adapter.DateAdapter;
+import io.arex.foundation.serializer.jackson.adapter.DurationAdapter;
 import io.arex.foundation.serializer.jackson.adapter.GregorianCalendarAdapter;
 import io.arex.foundation.serializer.jackson.adapter.InstantAdapter;
 import io.arex.foundation.serializer.jackson.adapter.JacksonExclusion;
@@ -25,6 +26,7 @@ import io.arex.foundation.serializer.jackson.adapter.LocalDateAdapter;
 import io.arex.foundation.serializer.jackson.adapter.LocalDateTimeAdapter;
 import io.arex.foundation.serializer.jackson.adapter.LocalTimeAdapter;
 import io.arex.foundation.serializer.jackson.adapter.OffsetDateTimeAdapter;
+import io.arex.foundation.serializer.jackson.adapter.PeriodAdapter;
 import io.arex.foundation.serializer.jackson.adapter.SqlDateAdapter;
 import io.arex.foundation.serializer.jackson.adapter.SqlTimeAdapter;
 import io.arex.foundation.serializer.jackson.adapter.TimestampAdapter;
@@ -37,11 +39,13 @@ import javax.xml.datatype.XMLGregorianCalendar;
 import java.lang.reflect.Type;
 import java.sql.Time;
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
+import java.time.Period;
 import java.time.ZonedDateTime;
 import java.util.Calendar;
 import java.util.Date;
@@ -154,6 +158,8 @@ public final class JacksonSerializer implements StringSerializable {
         module.addSerializer(Instant.class, new InstantAdapter.Serializer());
         module.addSerializer(OffsetDateTime.class, new OffsetDateTimeAdapter.Serializer());
         module.addSerializer(ZonedDateTime.class, new ZonedDateTimeAdapter.Serializer());
+        module.addSerializer(Duration.class, new DurationAdapter.Serializer());
+        module.addSerializer(Period.class, new PeriodAdapter.Serializer());
     }
 
     private void customTimeFormatDeserializer(SimpleModule module) {
@@ -170,6 +176,8 @@ public final class JacksonSerializer implements StringSerializable {
         module.addDeserializer(ZonedDateTime.class, new ZonedDateTimeAdapter.Deserializer());
         module.addDeserializer(java.sql.Date.class, new SqlDateAdapter.Deserializer());
         module.addDeserializer(Time.class, new SqlTimeAdapter.Deserializer());
+        module.addDeserializer(Duration.class, new DurationAdapter.Deserializer());
+        module.addDeserializer(Period.class, new PeriodAdapter.Deserializer());
     }
 
     public static class JacksonSimpleModule extends SimpleModule {

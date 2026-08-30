@@ -1035,7 +1035,7 @@ differs from earlier sections of this proposal, and why.
 - **Part A and Part B together**: added a combined endpoint touching both mechanisms in one
   request; confirmed both replay correctly within the same case, not just in isolation.
 
-### 12.4 Further hardening after real-app testing (Phase 0-5)
+### 12.4 Further hardening after real-app testing (Phase 0-7)
 
 Testing against a real target application (not just the demo) surfaced further gaps in Part B, all
 fixed since the sections above were written except one left deliberately open (noted at the end).
@@ -1092,22 +1092,51 @@ summarized here so this proposal's account of "what's actually running" stays cu
   capturing arbitrary application state, risking both payload bloat and, on replay, overwriting live
   mutable state (a cache, a connection) that has nothing to do with configuration.
 
-Each was found and fixed via live reproduction against `arex-spring-config-demo` (extended with
-matching fixtures for Phase 3's two gaps, Phase 4's null/enum gaps, and Phase 5's nested-constructor
-gap), then confirmed via the real
-`arex-schedule` webhook, including under genuine concurrent, multi-environment replay (20 distinct
-environments, 80 cases, fired concurrently against one shared replay target, zero
-cross-contamination) — same verification discipline as §12.3.
+- **Phase 6** — a record component whose value is a `List<String>` built via `Stream.toList()`
+  (e.g. after a filter/sort/map chain) is a `java.util.ImmutableCollections$ListN`, a JDK-internal
+  *final* class - the shared serializer's default typing embeds no type marker for it (same
+  final-class blind spot as Phase 4's enum gap), asymmetric with a sibling `List` component the
+  YAML binder populates as a plain, non-final `ArrayList`, which does get one. Deserializing the
+  resulting bare, unmarked array back into the blind `Object.class` target threw
+  `InvalidTypeIdException`, which `reconstruct()`'s fail-open catch turned into a silent revert to
+  the live value - not a crash, but silent data loss for that record's every component in the same
+  reconstruction. Fixed the same way as Phase 4(b): stopped using the type-embedding serializer for
+  record components entirely, since `reconstruct()` already knows each component's exact declared
+  type from `RecordComponent` and has no need for a runtime-resolved type marker in the first place.
 
-One further gap, found alongside Phase 4's three but with no clean fix identified, is deliberately
+- **Phase 7** — not a Spring-config bug, but fixed alongside the others: none of the three shared
+  Jackson serializers in `arex-instrumentation-foundation` (`JacksonSerializer`,
+  `JacksonSerializerWithType`, `JacksonRequestSerializer`) registered a `Duration`/`Period` adapter -
+  every other `java.time` type has one hand-rolled, but these two were simply missing, so Jackson's
+  built-in JSR-310 guard rejected them outright on serialize, before default typing or any
+  record/replay logic even entered the picture. Confirmed via the real-app log evidence that this
+  never actually surfaces in the Spring config feature (no `Duration` field is ever read through
+  `@Value`/`@ConfigurationProperties`/`Environment.getProperty()` in that app) - initially deferred
+  as out of this feature's scope, then fixed anyway on request, since the fix is narrow (two new
+  adapter classes following the exact existing pattern, registered in three places) despite the
+  broader blast radius of the classes it touches.
+
+Each of Phases 0-6 was found and fixed via live reproduction against `arex-spring-config-demo`
+(extended with matching fixtures for Phase 3's two gaps, Phase 4's null/enum gaps, Phase 5's
+nested-constructor gap, and Phase 6's final-class-list gap), then confirmed via the real
+`arex-schedule` webhook, including under genuine concurrent, multi-environment replay (Phase 6:
+15 distinct environments, 105 cases across all seven demo endpoints, fired concurrently against one
+shared replay target, zero cross-contamination) — same verification discipline as §12.3. Phase 7 has
+no Spring-config-specific reproduction path (per above), so it was verified at the unit level
+instead, directly against the three affected serializer classes.
+
+One further gap, found alongside Phase 4's three, has no clean fix identified and is deliberately
 left unaddressed: a record whose compact constructor performs a one-way, non-idempotent transform
 on one of its own components (filtering/sorting/mapping raw input down to something smaller) gets
 that transform silently re-applied during reconstruct-and-swap, since Java gives no way to invoke a
-record's canonical constructor without also running its compact constructor. The only
-architecturally-correct fix identified - capturing raw pre-binding property values and reconstructing
-via Spring Boot's own constructor-binding `Binder` instead of from accessor output - is
-substantially larger than anything built for this feature so far. See `SPRING_CONFIG_CHANGES.md`
-for the full writeup.
+record's canonical constructor without also running its compact constructor. Originally identified
+via code reading only; Phase 6's live verification reproduced it for the first time (as a live
+side-effect of reusing the same fixture shape to isolate Phase 6's own fix) - the affected
+component reconstructs as an *empty* list, not the recorded value, confirming the failure mode is
+silent data loss, same as Phase 6's bug was before its fix. The only architecturally-correct fix
+identified - capturing raw pre-binding property values and reconstructing via Spring Boot's own
+constructor-binding `Binder` instead of from accessor output - is substantially larger than
+anything built for this feature so far. See `SPRING_CONFIG_CHANGES.md` for the full writeup.
 
 ## 13. Debugging: tracing a request through the logs
 

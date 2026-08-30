@@ -13,8 +13,10 @@ import io.arex.inst.runtime.util.TypeUtil;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.sql.Time;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.Period;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
@@ -45,6 +47,22 @@ class JacksonSerializerTest {
         String json = JacksonSerializer.INSTANCE.serialize(now);
         LocalDateTime actualResult = JacksonSerializer.INSTANCE.deserialize(json, LocalDateTime.class);
         assertEquals(now, actualResult);
+    }
+
+    @Test
+    void testDuration() throws Throwable {
+        Duration expected = Duration.ofSeconds(125);
+        String json = JacksonSerializer.INSTANCE.serialize(expected);
+        Duration actualResult = JacksonSerializer.INSTANCE.deserialize(json, Duration.class);
+        assertEquals(expected, actualResult);
+    }
+
+    @Test
+    void testPeriod() throws Throwable {
+        Period expected = Period.of(1, 2, 3);
+        String json = JacksonSerializer.INSTANCE.serialize(expected);
+        Period actualResult = JacksonSerializer.INSTANCE.deserialize(json, Period.class);
+        assertEquals(expected, actualResult);
     }
 
     /**
@@ -167,6 +185,8 @@ class JacksonSerializerTest {
 
         assert expectedTimeTest.getInstant().equals(deserializedTimeTest.getInstant());
         assert expectedTimeTest.getZonedDateTime().equals(deserializedTimeTest.getZonedDateTime());
+        assert expectedTimeTest.getDuration().equals(deserializedTimeTest.getDuration());
+        assert expectedTimeTest.getPeriod().equals(deserializedTimeTest.getPeriod());
 
         assert expectedTimeTest.getJodaLocalDate().equals(deserializedTimeTest.getJodaLocalDate());
         assert expectedTimeTest.getJodaLocalTime().equals(deserializedTimeTest.getJodaLocalTime());

@@ -650,6 +650,174 @@ passed, zero cross-contamination between environments, zero leakage of the repla
 config into any response - `/api/issue-reasons` (the new Phase 5 fixture) held up under real
 concurrency exactly like the six pre-existing endpoints.
 
+## Investigation: real-app testing, round 3 (2026-08-28)
+
+Ran the pushed Phase 5 agent (`cf121c84`) against the real app again; two issues reported. As
+before, evidence came as 10 photos of another AI's analysis document (the user's log access is on
+a different machine), reviewed here and checked claim-by-claim against this repo's actual source
+rather than trusted at face value.
+
+**Issue 2 — `Duration`/`Period` adapters missing from all three shared Jackson serializers,
+confirmed real, initially deferred, then fixed anyway (see Phase 7).** The document's claim checks
+out, though an earlier pass through this file mischaracterized the actual gap — corrected here.
+Direct code read of all three `AutoService`-registered `StringSerializable` implementations in
+`io.arex.foundation.serializer.jackson` (`JacksonSerializer`, the plain default; `JacksonSerializerWithType`,
+the type-embedding one `RecordConfigSource` used before Phase 6; and `JacksonRequestSerializer`,
+serialize-only, used for request-signature matching) shows **none** of the three registers a
+`Duration`/`Period` adapter, and none registers Jackson's `JavaTimeModule` either — every other
+`java.time` type (`Instant`, `LocalDate(Time)`, `OffsetDateTime`, `ZonedDateTime`, etc.) is instead
+hand-rolled as an individual `SimpleModule` serializer/deserializer pair, and `Duration`/`Period`
+simply never got one added. Reproduced directly: serializing a bare `Duration` through any of the
+three throws `InvalidDefinitionException: Java 8 date/time type 'java.time.Duration' not supported
+by default: add Module "com.fasterxml.jackson.datatype:jackson-datatype-jsr310" to enable handling`
+— Jackson's built-in JSR-310 guard trips because no adapter is registered for the type, on the
+*serialize* side, not only deserialize. Confirmed via the same log excerpt's own evidence that this
+does **not** manifest anywhere in the Spring config feature specifically: every `Duration`-typed
+field the log shows is constructed at bean-construction time from plain Java code
+(`Duration.ofSeconds(...)` and similar), never read through `@Value`, `@ConfigurationProperties`
+constructor binding, or `Environment.getProperty()` — so it never enters
+`SpringBeanConfigExtractor`'s or `RecordConfigSource`'s recording pipeline at all. Initially left
+unfixed here on exactly that basis (out of this Spring-config-scoped effort's stated boundary,
+larger blast radius, needs its own testing pass) — then fixed anyway per explicit request; see
+Phase 7.
+
+## Phase 7 — `Duration`/`Period` adapters for all three shared Jackson serializers
+
+**Fix.** Added `DurationAdapter`/`PeriodAdapter` (new files, `io.arex.foundation.serializer.jackson.adapter`),
+matching the existing `InstantAdapter` pattern exactly: `toString()`/`parse()` for the ISO-8601
+duration/period format, and a `Serializer` that overrides `serializeWithType()` to write its own
+type-id wrapper — required for correct behavior under `JacksonSerializerWithType`'s
+`activateDefaultTyping(NON_FINAL)`, since a custom `JsonSerializer` bypasses Jackson's automatic
+type-id wrapping unless it does this itself (confirmed this is exactly what every other adapter in
+this package already does, for the same reason). Registered both adapters' `Serializer` in all
+three serializers' `customTimeFormatSerializer()`, and both `Deserializer`s in the two that actually
+deserialize (`JacksonSerializer`, `JacksonSerializerWithType`) — `JacksonRequestSerializer` never
+deserializes by design, serializer-only registration matches its existing pattern for every other
+time type.
+
+Scoped deliberately narrow: this only adds two missing type adapters to existing, already-shared
+infrastructure, using the exact pattern every other `java.time` type already follows in the same
+three classes — not a new mechanism, not a change to any of the three classes' existing behavior for
+any other type.
+
+| File | Change |
+|---|---|
+| `DurationAdapter.java`, `PeriodAdapter.java` | New — `Serializer`/`Deserializer` pair each, matching `InstantAdapter`'s shape. |
+| `JacksonSerializer.java` | Registers both adapters' serializer and deserializer. |
+| `JacksonSerializerWithType.java` | Registers both adapters' serializer and deserializer. |
+| `JacksonRequestSerializer.java` | Registers both adapters' serializer only (this class never deserializes). |
+
+**Tests:** `TimeTestInfo.java` (shared fixture used by `JacksonSerializerTest`,
+`JacksonSerializerWithTypeTest`, and `JacksonRequestSerializerTest`) gained `duration`/`period`
+fields. Added `testDuration`/`testPeriod` to `JacksonSerializerTest`; wired `duration`/`period`
+into the existing round-trip assertions in `testTimeSerializeAndDeserialize`
+(`JacksonSerializerTest`) and `testTimeSerializerWithType` (`JacksonSerializerWithTypeTest`).
+`JacksonRequestSerializerTest.serialize` already exercised the whole `TimeTestInfo` object; adding
+the two fields there was enough to catch the gap without a dedicated new test. Confirmed genuine:
+reverted just the three serializers' registration (kept the new adapter classes and all test
+changes) and reran — exactly the 5 tests touching `Duration`/`Period` failed, all with the expected
+`InvalidDefinitionException` (or, for the type-embedding serializer, `Type id handling not
+implemented for type java.lang.Object`), nothing else regressed; restored the fix, full
+`arex-instrumentation-foundation` suite green again (124 tests), and the dependent
+`arex-spring-config` module's suite unaffected.
+
+No live demo verification for this one — unlike the rest of this file, this fix has no
+Spring-config-specific reproduction path (confirmed above: `Duration`/`Period` never enters this
+feature's recording pipeline), so unit-level verification against the actual shared serializer
+classes is the right level, not a demo app change.
+
+**Issue 3 — `InvalidTypeIdException` on `List<String>` deserialization, confirmed real and in
+scope.** Traced to the actual root cause, independent of the document's own proposed fix (see
+below). `RecordConfigSource.serializeComponents()`/`reconstruct()` used
+`Serializer.serializeWithType()`/`deserializeWithType()`, whose mapper has
+`activateDefaultTyping(validator, DefaultTyping.NON_FINAL)` active — it embeds a `["ClassName",
+data]` type marker for a non-final runtime type but skips one that's `final`. A `List<String>`
+component built via `Stream.toList()` (Java 16+, e.g. after a filter/sort/map chain) is a
+`java.util.ImmutableCollections$ListN` — a JDK-internal *final* class — so it serializes as a bare,
+unmarked JSON array, asymmetric with a sibling `List` component that Spring Boot's YAML binder
+populated as a plain (non-final) `ArrayList`, which does get the marker.
+`Serializer.deserializeWithType()` always deserializes into bare `Object.class`; fed the bare array,
+Jackson reads its first element as a type-id string, fails `Class.forName(...)`, and throws
+`InvalidTypeIdException` — caught by `reconstruct()`'s outer try/catch, which falls open to
+`currentInstance`, silently discarding the recorded value for that component (and, transitively,
+every component reconstructed in that same call, since they share one canonical-constructor
+invocation).
+
+**The document's own proposed fix ("Option A": keep `deserializeWithType()`, just pass
+`component.getType()` instead of `Object.class`) was checked and rejected** — confirmed by reading
+`Serializer.java`/`JacksonSerializerWithType.java` directly that the *same* mapper instance still has
+`activateDefaultTyping(NON_FINAL)` active regardless of the requested target type; passing a
+concrete target type changes what Jackson binds the *tail* of the value into, not whether it still
+expects a leading type-id marker for a final-class value. It would not resolve the asymmetry and
+was never actually run against the real serializer to confirm it works. See Phase 6 below for the
+fix actually implemented and verified instead.
+
+## Phase 6 — record-component serializer: stop embedding a type marker
+
+**Fix.** `RecordConfigSource.serializeComponents()`/`reconstruct()` switched from
+`Serializer.serializeWithType()`/`deserializeWithType()` to the plain
+`Serializer.serialize()`/`Serializer.deserialize(String, Type)` — the latter using
+`component.getGenericType()` (not the erased `component.getType()`) so a component's own generic
+shape, e.g. `List<String>`, survives the round trip. The plain serializer's mapper never activates
+default typing at all (confirmed by direct code read of `JacksonSerializer.configMapper()`), so
+there's no marker to omit or misread in the first place. `reconstruct()` already knows each
+component's exact declared type from `RecordComponent` — unlike a genuinely polymorphic field,
+there's no ambiguity for a type marker to resolve, so sidestepping default typing entirely is safe
+here in a way it wouldn't be for an arbitrary `Object`-typed field. Same pattern as Phase 4's enum
+fix, applied one level down (record components instead of plain fields).
+
+| File | Change |
+|---|---|
+| `RecordConfigSource.java` | `serializeComponents()`/`reconstruct()` use `Serializer.serialize()`/`Serializer.deserialize(String, Type)` with `component.getGenericType()`, in place of `serializeWithType()`/`deserializeWithType()`. |
+
+**Tests:** `RecordConfigSourceTest.java` — added `ListFixture`, a record whose one component is
+built via `items.stream().toList()` in its compact constructor (the same final-class-producing
+shape as the real bug, but with an otherwise idempotent transform so it isolates the serialization
+question from the unrelated non-idempotent-constructor gap below), and
+`reconstruct_roundTripsAListComponentThatIsAJdkInternalFinalClass`, asserting a recorded value
+round-trips correctly through a component of that shape. Existing tests' `Serializer` stubs updated
+to mock `serialize`/`deserialize(String, Type)` instead of the old `WithType` variants; the
+aggregate-serialization test (`serializeComponents_serializesEveryComponentByName`) needed its stub
+to distinguish a `Map` argument (the aggregate call) from scalar ones (now also routed through the
+same mocked method, since a component's own value and its enclosing map are no longer served by two
+different mocked methods). Confirmed genuine: reverted the fix and reran — exactly the 4 tests
+touching `serialize`/`deserialize` failed (including the new regression test), all others
+unaffected; restored the fix, full suite green again.
+
+**Verified live** against `arex-spring-config-demo`: `KProperties` gained
+`scanNameListImmutable`, a `List<String>` component built via `.stream().toList()` in the compact
+constructor with no other transform — deliberately isolating Issue 3's actual root cause
+(type-marker asymmetry) from the unrelated, already-known, non-idempotent-compact-constructor gap
+(documented under "real-app testing after Phase 3, round 2" above) that `scanQTimeTypeOrder`
+also exercises. Recorded `/api/k-properties` at baseline config
+(`scanNameListImmutable: ["gamma","delta"]`), restarted with a distinct local value
+(`["WRONG-local-a","WRONG-local-b"]`), replayed the same case directly (`arex-record-id` header):
+`scanNameListImmutable` correctly returned the recorded `["gamma","delta"]`, not the local value —
+confirming the fix.
+
+`scanQTimeTypeOrder` in that same replayed response came back as `[]`, not the recorded
+`["1","12","4"]` — this is the pre-existing, separately-diagnosed non-idempotent-compact-constructor
+gap (round 2's investigation), now reproduced live for the first time: the recorded value is
+already-transformed, colon-free (`"1"`, `"12"`, `"4"`); reconstruct() feeds it back through the same
+canonical constructor, whose compact-constructor filter (`item.split(":").length >= 2`) rejects
+every element since none contain a colon, so the list reconstructs empty. This is expected, already
+scoped out with no clean fix identified (would need capturing raw pre-binding property values and
+re-running Spring Boot's own `Binder`, a substantially larger change than this feature's current
+approach) — not something Phase 6 attempts to fix. Kept in the fixture as a live demonstration of a
+known, distinct, open gap rather than removed, since it costs nothing to leave running alongside
+the isolated `scanNameListImmutable` fixture.
+
+Also verified at scale under genuine concurrent, multi-environment replay, same methodology as
+Phase 3/4/5: recorded 15 distinct environments across all seven established endpoints (105 cases
+total, 15 per endpoint), this round varying `/api/k-properties`'s `scanNameListImmutable` per
+environment as well as the existing per-environment `allow-fab`/`time-hour-list`/`optional-group`/
+`sort-direction` values. Fired all 105 cases concurrently against a single replay-target instance
+running a 16th, entirely distinct local config (including its own distinct
+`scanNameListImmutable`). Result: 105/105 passed, zero cross-contamination between environments,
+zero leakage of the replay target's local config into any response — `scanNameListImmutable`
+correctly reflected each environment's own recorded value across all 15 concurrent
+`/api/k-properties` cases, not just the single-request check above.
+
 ## What's *not* changed
 
 No existing instrumentation module, no existing shared runtime class (`MockUtils`, `ContextManager`,
