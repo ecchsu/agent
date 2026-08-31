@@ -16,7 +16,6 @@ import io.arex.foundation.serializer.gson.adapter.LocalTimeAdapter;
 import io.arex.foundation.serializer.gson.adapter.OffsetDateTimeAdapter;
 import io.arex.foundation.serializer.gson.adapter.TimeZoneAdapter;
 import io.arex.foundation.serializer.gson.adapter.XMLGregorianCalendarAdapter;
-import io.arex.foundation.serializer.gson.adapter.ZonedDateTimeAdapter;
 import io.arex.inst.runtime.serializer.StringSerializable;
 
 import javax.xml.datatype.XMLGregorianCalendar;
@@ -28,7 +27,6 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
-import java.time.ZonedDateTime;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.GregorianCalendar;
@@ -56,7 +54,6 @@ public class GsonRequestSerializer implements StringSerializable {
                 .registerTypeAdapter(LocalTime.class, new LocalTimeAdapter.RequestSerializer())
                 .registerTypeAdapter(Class.class, new ClassAdapter.Serializer())
                 .registerTypeAdapter(OffsetDateTime.class, new OffsetDateTimeAdapter.RequestSerializer())
-                .registerTypeAdapter(ZonedDateTime.class, new ZonedDateTimeAdapter.RequestSerializer())
                 .registerTypeHierarchyAdapter(TimeZone.class, new TimeZoneAdapter.Serializer())
                 .registerTypeAdapter(String.class, new StringAdapter.Serializer())
                 .registerTypeAdapterFactory(new CustomTypeAdapterFactory.RequestSerializerFactory())
